@@ -24,7 +24,7 @@ spec.md（做什么）→ plan.md（怎么做）→ task.md（按什么顺序做
 | 阶段 | 主题 | 技术栈 | 状态 | 文档 |
 |------|------|--------|------|------|
 | **v1** | 多协议 LLM 终端对话客户端 | Textual + async-first | **已实现**，验收见 [v1/checklist.md](v1/checklist.md) | [v1/](v1/) |
-| **v2** | 工具系统（读/写/改文件、执行命令、找文件、搜内容） | 待定 | **草稿，未开工** | [v2/](v2/) |
+| **v2** | 工具系统（读/写/改文件、执行命令、找文件、搜内容） | Textual + async-first（沿用 v1） | **已实现**，验收见 [v2/checklist.md](v2/checklist.md) | [v2/](v2/) |
 
 ### v1 做了什么
 
@@ -42,10 +42,29 @@ spec.md（做什么）→ plan.md（怎么做）→ task.md（按什么顺序做
 验收状态：`docs/v1/checklist.md` 逐条记录了证据。**唯一没验的是 anthropic 真机**
 （手上只有 OpenAI 兼容侧的密钥），`thinking: true` 那条只有单测覆盖。
 
-### v2 打算做什么
+### v2 做了什么
 
 给模型装上工具：读文件、写文件、改文件、执行命令、按模式找文件、搜代码内容。从「会聊天」
-到「能干活的 Agent」。方向见 [v2/spec.md](v2/spec.md)。
+到「能干活的 Agent」。要点：
 
-> ⚠️ **v2 四份文档目前是草稿**：文中还留着参考项目 `MewCode` 与 `ch02`/`ch03` 的称呼，
-> 章节划分也没对齐 Qicode 自己的术语。开工前要先过一遍、改成本项目的说法。
+- **新增两个包**：`qicode.tool`（工具抽象 + 注册中心 + 六个工具，零外部依赖）与
+  `qicode.agent`（单轮闭环编排）。两者都不 import 任何 LLM SDK，协议差异留在 `llm` 层。
+- **一套配置两种协议都能调工具**：Anthropic 用 `tool_use`/`tool_result`，OpenAI 用
+  `tool_calls`/`tool` 角色，上层看到的是一条统一的 `Event` 流。
+- **单轮闭环**：请求 → 工具执行 → 结果回灌 → 续答 → 停。连环调用（Agent Loop）
+  留到后续阶段。
+- **失败也是结果**：工具出错包成结构化结果回灌给模型，不抛异常、不中断会话；
+  界面用颜色区分。
+- **TUI 多一种块**：`ToolBlock` 渲染 Claude Code 风格的 `● name(args)` + 缩进结果摘要。
+
+设计文档：[需求](v2/spec.md) · [设计](v2/plan.md) · [任务](v2/task.md) · [验收](v2/checklist.md)。
+
+验收状态：`docs/v2/checklist.md` 逐条记录了证据（33 项勾上，2 项留空）。**唯一的缺口是
+官方 `api.anthropic.com` 真机链路**——`AnthropicProvider` 这条代码路径是跑过的（DeepSeek
+的 anthropic 兼容端点），没跑过的是官方服务本身（`thinking` 块结构、官方 `stop_reason`
+语义）。「两协议一致」那条用同一个 key、同一个模型只换 `protocol` / `base_url` 做了对照，
+见 checklist 末尾的「跨协议 A/B」。
+
+> ⚠️ v2 有一处**已知取舍**：Anthropic 开了 extended thinking 就与本阶段的工具不兼容
+> （回灌缺 thinking 签名会被 400），所以「开了 thinking 就不发工具定义」，并在界面明说。
+> 详见 [v2/plan.md](v2/plan.md) 末尾「关于 thinking 与工具的冲突」。

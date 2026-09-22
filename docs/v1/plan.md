@@ -84,6 +84,15 @@ class Provider(Protocol):
 
 def new_provider(cfg: ProviderConfig) -> Provider: ...   # 按 protocol 构造适配器
 
+> **v2 在上面这几个类型上做了扩展**（这里是 v1 的原始设计，改动见 [v2/plan.md](../v2/plan.md)）：
+>
+> - `Message.role` 多了 `"tool"`，并新增 `tool_calls` / `tool_results` 两个字段；
+> - `StreamEvent` 多了 `tool_calls`，适配器在流结束时把拼好的调用吐出来；
+> - `Provider` 多了 `supports_tools` 属性，`stream()` 多了 `tools` 参数
+>   （传空列表就退回 v1 的行为）。
+>
+> 三项全是**追加**、都有默认值，v1 的调用方一行都不用改。
+
 # ───────── conversation 层 ─────────
 class Conversation:
     def __init__(self) -> None:
