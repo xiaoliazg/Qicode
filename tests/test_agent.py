@@ -20,6 +20,7 @@ from qicode.agent import (
     Agent,
     Event,
     Phase,
+    preview_args,
 )
 from qicode.conversation import Conversation
 from qicode.llm import Message, StreamEvent, ToolCall
@@ -271,6 +272,68 @@ def test_long_tool_args_are_truncated_in_the_preview_only(make_provider) -> None
     assert start.args == long_input[:MAX_ARGS_PREVIEW] + "…"
     # 工具收到的是**原封不动**的完整参数。
     assert tool.calls == [long_input]
+
+
+# ────────────────────────── 参数预览的可读性 ──────────────────────────
+#
+# 这一组是居居在真机上发现的：工具行里一条中文路径显示成 `琪琪作业`。
+# 功能没问题（`json.loads` 解析结果一样），坏的是**给人看的那一行**。
+#
+# 根因在 `anthropic_provider._tool_calls_of`（`json.dumps` 漏了 `ensure_ascii=False`），
+# 已经在那儿修了。这里的还原是**防御性**的：`base_url` 由用户填，第三方网关有可能会
+# 转义。实测过 DeepSeek 的 OpenAI 兼容端点直接发 UTF-8，所以这条路径目前不会被触发。
+
+
+def test_preview_decodes_unicode_escapes() -> None:
+    """`\\uXXXX` 转义要还原成真字符。
+
+    `write_file` 那类的参数里，路径和内容都可能是中文——屏幕上印出六个字符一组的
+    转义码，等于这条工具行没写给人看。
+    """
+    escaped = json.dumps({"path": "琪琪作业/快排.txt"})  # ensure_ascii=True，默认值
+
+    assert "\\u742a" in escaped  # 前提：dumps 确实转义了
+    assert preview_args(escaped) == '{"path": "琪琪作业/快排.txt"}'
+
+
+def test_preview_leaves_unescaped_json_alone() -> None:
+    """**没有**转义时逐字节原样返回，不顺手重新排版。
+
+    模型发 `{"a":1}` 还是 `{"a": 1}` 是它的自由，预览没有理由替它统一——而且
+    「先解析再 dumps」这条路对一次几 MB 的 `write_file` 是白解析一遍。
+    """
+    plain = '{"path":"a.py","content":"hello"}'
+
+    assert preview_args(plain) == plain
+
+
+def test_preview_falls_back_when_the_json_is_broken() -> None:
+    """带转义但**不是合法 JSON** 时原样返回，绝不抛。
+
+    模型偶尔真的会发截断的 JSON。这一层是给人看的，不该在画之前先把界面搞崩——
+    那种情况由工具侧报「参数不是合法的 JSON」，不归预览管。
+
+    注意 `\\u` 那三个字符本身也可能只是字符串里的普通内容（写正则、写转义序列），
+    所以「含 `\\u`」只决定**要不要试**，不决定结果对不对。
+    """
+    for broken in ['{"path": "\\u742a', "\\u742a\\u742a", '["\\u742a"]']:
+        assert preview_args(broken) == broken
+
+
+def test_preview_truncates_after_decoding_not_before() -> None:
+    """先还原、后截断。
+
+    反过来的话，一条中文路径会被按六倍长度算，还没上屏就被砍掉了——而截断的**目的**
+    是别让工具行撑成好几行，那本来就是按显示宽度算的账。
+    """
+    path = "作业/" * 20  # 转义后 480 字符，还原后 60 字符
+    escaped = json.dumps({"path": path})
+
+    preview = preview_args(escaped)
+
+    assert "\\u" not in preview
+    assert preview.endswith("…") is False  # 60 字符没超 80
+    assert path in preview
 
 
 # ────────────────────────── AC9：单轮上限 ──────────────────────────

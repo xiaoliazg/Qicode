@@ -259,6 +259,31 @@ def test_transcript_truncates_long_tool_arguments() -> None:
     assert "…" in text
 
 
+def test_transcript_decodes_unicode_escapes_in_tool_args() -> None:
+    """回放里的工具行同样要还原转义——它跟对话区共用 `preview_args`。
+
+    回放是用户按完 `/exit` 之后看的最后一眼（也是唯一一眼），那儿印一串 `\\u742a`
+    比对话区里更难受：旁边没有工具结果行可以拿来对照。
+    """
+    messages = [
+        Message(
+            role=ROLE_ASSISTANT,
+            tool_calls=[
+                ToolCall(
+                    id="c1",
+                    name="write_file",
+                    input=json.dumps({"path": "琪琪作业/快排.txt"}),
+                )
+            ],
+        )
+    ]
+
+    text = render_transcript(messages)
+
+    assert "琪琪作业/快排.txt" in text
+    assert "\\u742a" not in text
+
+
 def test_transcript_still_shows_a_call_that_never_got_a_result() -> None:
     """取消发生在工具执行期间时，那次调用只留下了 assistant 那半条。
 

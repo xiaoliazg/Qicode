@@ -122,7 +122,7 @@ def _tool_calls_of(final: Any) -> list[ToolCall]:
 
     `block.input` 是 SDK 解析好的**对象**，而 `ToolCall.input` 要的是原始字符串
     （注册中心吃字符串，工具内部本来也要自己解析一遍才能报「参数不是合法 JSON」），
-    所以这里 dumps 回去。
+    所以这里 dumps 回去——**必须带 `ensure_ascii=False`**（理由见下面那行注释）。
 
     `stop_reason` 是服务端给出的、最明确的「我这轮是想调工具」信号。用它做闸门，
     顺带挡掉一种更麻烦的情况：`max_tokens` 截断时也可能留下一个 input 不完整的
@@ -132,7 +132,15 @@ def _tool_calls_of(final: Any) -> list[ToolCall]:
         return []
     return [
         # `input` 是 SDK 解析好的 dict，dumps 回字符串。
-        ToolCall(id=b.id, name=b.name, input=json.dumps(b.input))
+        #
+        # `ensure_ascii=False` 不是可选项。它的默认值 `True` 意思是「输出只准落在
+        # ASCII 里」，于是每个非 ASCII 字符都被翻成 `\uXXXX`：一条中文路径
+        # `/Users/me/琪琪作业/快排.txt` 会变成 `/Users/me/琪琪作业/...`。
+        # `json.loads` 解析结果一模一样（所以功能没坏），坏的是**给人看的那一行**——
+        # 它会在工具行里原样上屏，而同一块的结果行回显的是真字符，两种写法打架。
+        # JSON 本来就是 UTF-8 编码的，这层转义是给「只能跑 ASCII 的老通道」准备的保险，
+        # 我们没有这个约束。
+        ToolCall(id=b.id, name=b.name, input=json.dumps(b.input, ensure_ascii=False))
         for b in final.content
         if b.type == "tool_use"
     ]

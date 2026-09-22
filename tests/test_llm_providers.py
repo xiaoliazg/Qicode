@@ -723,6 +723,33 @@ def test_anthropic_yields_tool_calls_before_done() -> None:
     assert events[-1].tool_calls == []
 
 
+def test_anthropic_keeps_non_ascii_tool_args_readable() -> None:
+    """参数里的非 ASCII 字符**不许**被转义成 `\\uXXXX`。
+
+    真机上发现的：一条中文路径 `/Users/me/琪琪作业/快排.txt` 在工具行里显示成
+    `/Users/me/\\u742a\\u742a\\u4f5c\\u4e1a/...`。起因就是这里 `json.dumps` 漏了
+    `ensure_ascii=False`——它的默认值是 `True`，意思是「输出只准落在 ASCII 里」。
+
+    坏的不是功能（`json.loads` 两种写法解析结果一样，工具拿到的路径是对的），
+    坏的是**给人看的那一行**：工具行印转义码，紧挨着的结果行回显真字符，同一块里
+    两种写法打架，看着像两个不同的文件。
+
+    JSON 本身就是 UTF-8 编码的，这层转义是给「只能跑 ASCII 的老通道」准备的保险，
+    我们没有这个约束。
+    """
+    final = final_message(
+        [tool_use_block("call_1", "write_file", {"path": "琪琪作业/快排.txt"})],
+        stop_reason="tool_use",
+    )
+    provider, _ = anthropic_with([], final=final)
+
+    events = asyncio.run(collect(provider))
+
+    assert events[-2].tool_calls == [
+        ToolCall(id="call_1", name="write_file", input='{"path": "琪琪作业/快排.txt"}')
+    ]
+
+
 def test_anthropic_finds_tool_calls_only_in_the_final_message() -> None:
     """工具调用**不是**从流式增量里拼的，只在终态消息里取。
 

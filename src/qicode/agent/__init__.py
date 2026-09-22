@@ -11,6 +11,7 @@
 一处读，边界才干净。
 """
 
+import json
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from enum import Enum
@@ -97,6 +98,38 @@ class _Turn:
     err: Exception | None = None
 
 
+def _readable(raw: str) -> str:
+    """把参数里 `\\uXXXX` 形式的转义还原成真字符，**纯为了好看**。
+
+    **这一层是防御性的，我们自己那两个适配器现在都不会喂进转义。** 实测过：Anthropic
+    那条路原来会（`json.dumps` 漏了 `ensure_ascii=False`），源头已在
+    `anthropic_provider._tool_calls_of` 修掉；DeepSeek 的 OpenAI 兼容端点直接发 UTF-8，
+    不转义。留在这里是因为 `base_url` 是**用户填的**——各种第三方网关（Go/Java 写的
+    代理、老的 OpenAI 兼容实现）出于「输出只准落在 ASCII 里」的习惯确实会转义，
+    撞上了就跟这次一样：功能没坏，屏幕上是一条读不出来的工具行。
+
+    成本很低：只有真的出现 `\\u` 才去解析，绝大多数调用是原样返回——既不篡改模型
+    原本的排版（有的发 `{"a":1}`、有的发 `{"a": 1}`，那是它的自由），也免得一次几 MB
+    的 `write_file` 为了显示 80 个字符把整段 JSON 解析一遍。
+
+    解析失败（模型偶尔真的会发非法 JSON）或结果不是对象时同样原样返回。这一层是给人
+    看的，不该在画之前先把自己搞崩——「参数不是合法 JSON」那条结构化错误由工具侧报，
+    不归这里管。
+    """
+    if "\\u" not in raw:
+        return raw
+    try:
+        parsed = json.loads(raw)
+    except ValueError:
+        # JSONDecodeError 是 ValueError 的子类，这一句就够。
+        return raw
+    if not isinstance(parsed, dict):
+        return raw
+    # `ensure_ascii=False` 只让非 ASCII 出字。换行仍是 `\n`、引号仍是 `\"`，
+    # 所以结果**仍然是一行**——这个函数的前提就是「一行」。
+    return json.dumps(parsed, ensure_ascii=False)
+
+
 def preview_args(raw: str) -> str:
     """把工具参数压成一行能看的预览。
 
@@ -104,12 +137,16 @@ def preview_args(raw: str) -> str:
     （`qicode.tui.view.transcript`）。回放拿到的 `ToolCall.input` 是**完整**的原始
     参数（历史里存的就是全文，截断只发生在界面上），不共用这一份规则的话，
     回放时一次 `write_file` 会把整个文件内容印到终端上，跟对话区里看到的完全两样。
+
+    先还原转义再截断（`_readable`）：截断是**按显示出来的字符**算的，反过来的话一条
+    中文路径会被算成六倍长度，还没上屏就被砍掉了。
     """
-    if len(raw) <= MAX_ARGS_PREVIEW:
-        return raw
+    text = _readable(raw)
+    if len(text) <= MAX_ARGS_PREVIEW:
+        return text
     # 截断要**说出来**。不标省略号的话，界面上的 `{"path": "src/qic` 看着就像一个
     # 完整的（而且写错了的）参数，反而让人以为模型发的东西不对。
-    return raw[:MAX_ARGS_PREVIEW] + "…"
+    return text[:MAX_ARGS_PREVIEW] + "…"
 
 
 class Agent:
