@@ -23,7 +23,7 @@ from qicode.config import ProviderConfig
 from qicode.llm import Message, StreamEvent
 from qicode.llm.anthropic_provider import MAX_TOKENS, THINKING_PARAMS, AnthropicProvider
 from qicode.llm.openai_provider import OpenAIProvider
-from qicode.prompt import SYSTEM_PROMPT
+from qicode.prompt import system_prompt
 
 
 def make_cfg(**over: Any) -> ProviderConfig:
@@ -209,7 +209,7 @@ def test_anthropic_sends_system_as_top_level_param() -> None:
     )
 
     assert fake.params is not None
-    assert fake.params["system"] == SYSTEM_PROMPT
+    assert fake.params["system"] == system_prompt("test", "test-model")
     assert fake.params["messages"] == [
         {"role": "user", "content": "你好"},
         {"role": "assistant", "content": "在"},
@@ -226,9 +226,47 @@ def test_openai_sends_system_as_first_message() -> None:
 
     assert fake.params is not None
     messages = fake.params["messages"]
-    assert messages[0] == {"role": "system", "content": SYSTEM_PROMPT}
+    assert messages[0] == {
+        "role": "system",
+        "content": system_prompt("test", "test-model"),
+    }
     assert messages[1] == {"role": "user", "content": "你好"}
     assert fake.params["stream"] is True
+
+
+@pytest.mark.parametrize("protocol", ["anthropic", "openai"])
+def test_system_prompt_tells_the_model_which_model_it_is(protocol: str) -> None:
+    """F4：两条协议都要把「你是谁、跑在什么模型上」交给模型。
+
+    这两个值只有我们这边知道——它们是本地配置里的字段，模型自己看不到。不写进
+    提示词，用户一问「你是什么模型」它就只会答「我不掌握这个信息」（实测原话），
+    再不然凭训练数据编一个。
+
+    对**两条协议**分别验，是因为注入位置本来就不同（Anthropic 走顶层 `system`，
+    OpenAI 兼容走 messages 首条）；将来加第三个适配器时漏掉，这里能拦下来。
+    """
+    identity = {"name": "my-deepseek", "model": "deepseek-chat"}
+    # 标成 Any 是故意的：两条协议返回的是两套不同的假件类型，这里只关心
+    # `params` 里装了什么，不想为了让 mypy 满意去写一个联合类型。
+    provider: Any
+    fake: Any
+    if protocol == "anthropic":
+        provider, fake = anthropic_with([text_delta("好")], **identity)
+    else:
+        provider, fake = openai_with([chunk("好")], **identity)
+
+    asyncio.run(collect(provider))
+
+    assert fake.params is not None
+    sent = (
+        fake.params["system"]
+        if protocol == "anthropic"
+        else fake.params["messages"][0]["content"]
+    )
+    # 两个值都得在，而且得是**本次**这两个——只验其中一个的话，
+    # 把另一个写死成常量也照样能过。
+    assert "my-deepseek" in sent
+    assert "deepseek-chat" in sent
 
 
 # ────────────────────────── F5：thinking 识别但不渲染 ──────────────────────────

@@ -12,7 +12,7 @@ from openai.types.chat import ChatCompletionMessageParam
 
 from qicode.config import ProviderConfig
 from qicode.llm import Message, StreamEvent
-from qicode.prompt import SYSTEM_PROMPT
+from qicode.prompt import system_prompt
 
 
 def _to_sdk_message(msg: Message) -> ChatCompletionMessageParam:
@@ -53,8 +53,10 @@ class OpenAIProvider:
 
     async def stream(self, msgs: list[Message]) -> AsyncIterator[StreamEvent]:
         # 这条协议没有顶层 system 参数，system prompt 是 messages 的第一条。
+        # 现拼而不是用常量：里面要带上本次的接入点和模型名，模型才知道自己是谁
+        # （理由见 `qicode.prompt.system_prompt`）。
         messages: list[ChatCompletionMessageParam] = [
-            {"role": "system", "content": SYSTEM_PROMPT}
+            {"role": "system", "content": system_prompt(self._name, self._model)}
         ]
         messages += [_to_sdk_message(m) for m in msgs]
 

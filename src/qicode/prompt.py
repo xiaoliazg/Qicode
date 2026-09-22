@@ -43,8 +43,28 @@ def _render_pixel_art(art: str, colors: dict[str, str]) -> str:
 # 吉祥物图案，已是可直接嵌入 Rich 输出的 markup。
 MASCOT_BANNER: str = _render_pixel_art(MASCOT_ART, MASCOT_COLORS)
 
-SYSTEM_PROMPT = """\
+def system_prompt(provider_name: str, model: str) -> str:
+    """按当前接入点拼出 system prompt。
+
+    **为什么要把 provider / model 写进去。** 这两个值只有我们这边知道——它们是
+    本地配置里的字段，模型自己看不到。不告诉它，用户问「你是什么模型」它就只能
+    答「我不掌握这个信息」（这是实测的原话），再不然就凭训练数据编一个。
+    与其让它猜，不如把**已知的事实**交给它。
+
+    措辞上有意分开两件事：
+
+    - 「你是谁、跑在什么模型上」——我们知道，要求它照实说；
+    - 「这个模型是哪家公司训练的」——我们不知道，就明确说不知道。
+
+    否则一句笼统的「不要编造」会让它对**两者**都用同一句「我不知道」搪塞过去，
+    而那正是要修的毛病。
+    """
+    return f"""\
 你是 Qicode，一个运行在用户终端里的 AI 助手。
+
+本次会话由接入点「{provider_name}」上的模型 {model} 生成回复。
+用户问起你是谁、用的是什么模型时，就照这两条如实回答——不要推说不知道。
+至于这个模型是哪家公司训练的，本地配置里没有这个信息，那一条就说不知道。
 
 - 回答直接、准确，不要寒暄和客套。
 - 涉及代码时用 markdown 代码块，并标注语言。

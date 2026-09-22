@@ -11,7 +11,7 @@ import anthropic
 
 from qicode.config import ProviderConfig
 from qicode.llm import Message, StreamEvent
-from qicode.prompt import SYSTEM_PROMPT
+from qicode.prompt import system_prompt
 
 # 请求开启思考时发出去的参数。
 #
@@ -57,7 +57,9 @@ class AnthropicProvider:
             "model": self._model,
             "max_tokens": MAX_TOKENS,
             # system 是 Anthropic 协议的顶层参数，不混在 messages 里。
-            "system": SYSTEM_PROMPT,
+            # 现拼而不是用常量：里面要带上本次的接入点和模型名，模型才知道
+            # 自己是谁（理由见 `qicode.prompt.system_prompt`）。
+            "system": system_prompt(self._name, self._model),
             "messages": [{"role": m.role, "content": m.content} for m in msgs],
         }
         if self._thinking:
