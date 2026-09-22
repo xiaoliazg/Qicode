@@ -7,6 +7,7 @@ import pytest
 import yaml
 
 from qicode.cli import main
+from qicode.conversation import Conversation
 
 
 def test_missing_config_exits_with_readable_message(tmp_path, monkeypatch, capsys):
@@ -84,6 +85,7 @@ def test_valid_config_starts_the_app(tmp_path, monkeypatch):
     class FakeApp:
         def __init__(self, providers: object) -> None:
             started.append(providers)
+            self.conv = Conversation()
 
         def run(self) -> None:
             started.append("ran")
@@ -97,3 +99,80 @@ def test_valid_config_starts_the_app(tmp_path, monkeypatch):
     providers = started[0]
     assert isinstance(providers, list)
     assert providers[0].name == "anthropic"
+
+
+def test_transcript_is_replayed_after_exit(tmp_path, monkeypatch, capsys):
+    """退出后把会话打到主屏幕上（checklist 的 scrollback 那条）。
+
+    Textual 跑在备用屏幕上，`run()` 一返回整屏内容就没了。这条用例守的是
+    「退出之后还能看到刚才聊了什么」——回放必须发生在 `run()` **之后**。
+    """
+    cfg_dir = tmp_path / ".qicode"
+    cfg_dir.mkdir()
+    doc = {
+        "providers": [
+            {
+                "name": "a",
+                "protocol": "anthropic",
+                "api_key": "sk-test",
+                "model": "m",
+            }
+        ]
+    }
+    (cfg_dir / "config.yaml").write_text(
+        yaml.safe_dump(doc, allow_unicode=True), encoding="utf-8"
+    )
+    monkeypatch.chdir(tmp_path)
+
+    class FakeApp:
+        def __init__(self, providers: object) -> None:
+            self.conv = Conversation()
+            self.conv.add_user("我叫居居")
+            self.conv.add_assistant("记住了。")
+
+        def run(self) -> None:
+            # 打一个记号，等下用来验**顺序**：回放必须排在 run() 返回之后。
+            print("RUN-RETURNED", flush=True)
+
+    monkeypatch.setattr("qicode.cli.QicodeApp", FakeApp)
+
+    main()
+
+    out = capsys.readouterr().out
+    assert "我叫居居" in out
+    assert "记住了。" in out
+    # 顺序：备用屏幕还没退出时打的东西会被一起丢掉，所以回放必须在 run() 之后。
+    assert out.index("RUN-RETURNED") < out.index("我叫居居")
+
+
+def test_nothing_is_replayed_when_nothing_was_said(tmp_path, monkeypatch, capsys):
+    """一句没聊就退出：不打一片空白出来。"""
+    cfg_dir = tmp_path / ".qicode"
+    cfg_dir.mkdir()
+    doc = {
+        "providers": [
+            {
+                "name": "a",
+                "protocol": "anthropic",
+                "api_key": "sk-test",
+                "model": "m",
+            }
+        ]
+    }
+    (cfg_dir / "config.yaml").write_text(
+        yaml.safe_dump(doc, allow_unicode=True), encoding="utf-8"
+    )
+    monkeypatch.chdir(tmp_path)
+
+    class FakeApp:
+        def __init__(self, providers: object) -> None:
+            self.conv = Conversation()
+
+        def run(self) -> None:
+            pass
+
+    monkeypatch.setattr("qicode.cli.QicodeApp", FakeApp)
+
+    main()
+
+    assert capsys.readouterr().out == ""
