@@ -62,9 +62,11 @@
 2. `src/qicode/__init__.py`：定义 `__version__ = "0.1.0"`。
 3. `src/qicode/__main__.py`：`from .cli import main; main()`。
 4. `src/qicode/cli.py` 写一个临时 `main()`，打印 `f"qicode {__version__}"` 并退出，确保可启动。
-5. 安装依赖：`uv sync`（推荐）或 `pip install -e ".[dev]"`。
+5. 安装依赖：在已激活的 conda 环境 `Qicode` 里跑 `uv pip install -e . --group dev`。
+   **不要用 `uv sync`**——它会另建一个 `.venv`，跟本项目「用 conda 环境开发」的约定冲突。
+   也可以 `uv pip install --python <conda 里的 python> -e . --group dev`，不必先激活。
 
-**验证：** `python -m qicode` 能打印版本号；`uv run qicode`（或 `qicode`）同样可用；`uv pip list` / `pip list` 能看到上述依赖。
+**验证：** `python -m qicode` 能打印版本号；`qicode` 命令同样可用；`uv pip list` / `pip list` 能看到上述依赖。
 
 ## T2: config 模块
 **文件：** `src/qicode/config.py`、`tests/test_config.py`

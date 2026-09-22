@@ -1,0 +1,45 @@
+# Qicode 配置文件示例
+#
+# 用法：复制为 .qicode/config.yaml，再把 api_key 换成你自己的
+#   mkdir -p .qicode && cp .qicode/config.yaml.example .qicode/config.yaml
+#
+# .qicode/config.yaml 已在 .gitignore 里忽略——那个文件要放真实密钥，别提交。
+
+# ── 字段 ───────────────────────────────────────────────────────────────
+#   name      必填   供应商标识名，显示在状态栏左侧
+#   protocol  必填   协议类型：anthropic 或 openai
+#   api_key   必填   认证密钥
+#   model     必填   模型名（服务端注册/约定的模型 ID），显示在状态栏右侧
+#   base_url  可选   自定义端点地址；不写就用该协议 SDK 的默认端点
+#   thinking  可选   是否「主动请求」扩展思考，缺省 false；只有 anthropic 会读它
+#
+# ⚠️ api_key 请直接填明文。本项目**不做变量展开**：写成 ${ANTHROPIC_API_KEY}
+#    会被当成密钥字面量原样发出去，最后撞一个认证失败——而不是像某些工具那样
+#    去读环境变量。保护方式是把 .qicode/config.yaml 挡在版本库外面。
+#
+# ── 关于 thinking ─────────────────────────────────────────────────────
+# 它的含义是「主动请求服务端开启思考」，关掉**不等于**服务端一定不思考：不发这个
+# 参数时服务端用自己的默认值，而部分后端（比如 DeepSeek 的 Anthropic 端点）默认
+# 就是开着的。
+# 另外，当前 Claude 模型上 {type: enabled, budget_tokens: N} 这种固定预算写法已经
+# 被移除，传了直接返回 400。本项目不发这个参数，所以不会踩到。
+
+providers:
+  # Anthropic 协议：官方 Claude，或任何提供 Anthropic 兼容端点的服务
+  - name: claude
+    protocol: anthropic
+    model: claude-sonnet-5
+    base_url: https://api.anthropic.com
+    api_key: 换成你自己的密钥        # ← 必须改，否则对话时认证失败
+    thinking: true
+
+  # OpenAI 兼容协议：本地 Ollama、OpenAI 官方、各类兼容网关
+  #
+  # 下面这条不需要密钥，装好 Ollama 就能跑通。想用就把上面那条注释掉、这段放开。
+  # （两条都启用也可以：启动时会先用方向键让你选一个。）
+  # - name: ollama
+  #   protocol: openai
+  #   model: qwen2.5vl:7b
+  #   base_url: http://127.0.0.1:11434/v1
+  #   api_key: ollama                 # Ollama 不校验密钥，填任意非空值
+  #   thinking: false

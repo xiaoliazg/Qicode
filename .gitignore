@@ -225,9 +225,12 @@ __marimo__/
 # macOS
 .DS_Store
 
-# 本地真实配置不入库（示例 config.example.yaml 正常提交）
-config.yaml
-.qicode/
+# 本地真实配置不入库。
+# 这里只忽略 config.yaml 本身，而不是整个 .qicode/：模板
+# .qicode/config.yaml.example 要提交，整目录忽略会把它一起吞掉。
+# 也没写裸的 `config.yaml`——那会连同任何目录下的同名文件一起忽略，
+# 将来放个测试夹具进去会被静默漏掉。真实配置就一份，路径写死更安全。
+.qicode/config.yaml
 
 # 开发临时
 .qicode_dev/
