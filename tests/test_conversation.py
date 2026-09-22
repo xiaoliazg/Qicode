@@ -1,7 +1,7 @@
-"""`Conversation` 的单测（T6）。"""
+"""`Conversation` 的单测（T6、T13）。"""
 
 from qicode.conversation import Conversation
-from qicode.llm import Message
+from qicode.llm import Message, ToolCall, ToolResult
 
 
 def test_empty_conversation_has_no_messages() -> None:
@@ -66,3 +66,61 @@ def test_empty_text_is_kept_as_is() -> None:
     conv.add_user("")
 
     assert conv.messages() == [Message(role="user", content="")]
+
+
+# ────────────────────────── T13：工具回合入历史 ──────────────────────────
+
+
+def test_tool_round_trip_lands_in_history_in_order() -> None:
+    """一轮完整工具对话的四条历史：问 → 调工具 → 结果 → 最终答复。
+
+    顺序错了就发不出去：协议靠 id 配对，assistant 的 tool_calls 和 tool 的结果
+    必须紧挨着、且调用在前，缺一头或颠倒了，服务端只会回一句「对不上账」。
+    """
+    conv = Conversation()
+    call = ToolCall(id="call_1", name="read_file", input='{"path": "a.py"}')
+    result = ToolResult(tool_call_id="call_1", content="1\timport os")
+
+    conv.add_user("看看 a.py")
+    conv.add_assistant_with_tool_calls("我读一下", [call])
+    conv.add_tool_results([result])
+    conv.add_assistant("它导入了 os")
+
+    msgs = conv.messages()
+
+    assert len(msgs) == 4
+    assert [m.role for m in msgs] == ["user", "assistant", "tool", "assistant"]
+    assert msgs[1].content == "我读一下"
+    assert msgs[1].tool_calls == [call]
+    assert msgs[2].content == ""
+    assert msgs[2].tool_results == [result]
+    assert msgs[3].content == "它导入了 os"
+    assert msgs[3].tool_calls == []
+
+
+def test_assistant_tool_round_may_have_empty_preamble() -> None:
+    """一句话不说直接开调是合法的，不能被当成「空回合」丢掉。"""
+    conv = Conversation()
+    conv.add_assistant_with_tool_calls("", [ToolCall(id="c", name="bash", input="{}")])
+
+    msgs = conv.messages()
+
+    assert len(msgs) == 1
+    assert msgs[0].content == ""
+    assert len(msgs[0].tool_calls) == 1
+
+
+def test_tool_round_copies_the_caller_lists() -> None:
+    """外面那份列表被改，历史不能跟着变——历史是后续每一轮的上下文。"""
+    conv = Conversation()
+    calls = [ToolCall(id="c1", name="bash", input="{}")]
+    results = [ToolResult(tool_call_id="c1", content="ok")]
+
+    conv.add_assistant_with_tool_calls("", calls)
+    conv.add_tool_results(results)
+    calls.append(ToolCall(id="c2", name="bash", input="{}"))
+    results.clear()
+
+    msgs = conv.messages()
+    assert len(msgs[0].tool_calls) == 1
+    assert len(msgs[1].tool_results) == 1

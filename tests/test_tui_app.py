@@ -1,4 +1,4 @@
-"""`QicodeApp` 的集成测试（T9–T12）。
+"""`QicodeApp` 的集成测试（T9–T12、T16）。
 
 用 Textual 官方的 `run_test()` 驱动：它在无头模式下**真跑一个 App**——真正的
 compose、真正的消息分发、真正的键盘事件。所以这些用例验的是**界面行为**，
@@ -9,26 +9,87 @@ compose、真正的消息分发、真正的键盘事件。所以这些用例验�
 """
 
 import asyncio
+import json
 from collections.abc import Awaitable, Callable
+from typing import Any
 
 import pytest
 from textual.containers import VerticalScroll
 from textual.pilot import Pilot
 
 from qicode.config import ProviderConfig
-from qicode.llm import StreamEvent
+from qicode.llm import StreamEvent, ToolCall
 from qicode.prompt import BOUNCE_PERIOD_FRAMES
+from qicode.tool import Registry, Result
 from qicode.tui.app import QicodeApp, SessionState
-from qicode.tui.view import MARKER, MascotBanner, PromptArea, ReplyBlock
+from qicode.tui.view import MARKER, MascotBanner, PromptArea, ReplyBlock, ToolBlock
 
 Scenario = Callable[[QicodeApp, Pilot], Awaitable[None]]
 
 
-def with_app(providers: list[ProviderConfig], scenario: Scenario) -> None:
-    """起一个 App 跑一遍 scenario，跑完自动收摊。"""
+class StubTool:
+    """界面测试用的假工具：不碰文件系统，回一段固定的文本。
+
+    真工具（`qicode.tool.read_file` 等）在 `tests/test_tool.py` 里各自有单测；
+    这里要验的是**界面怎么画一次工具调用**，拿真工具就得先铺一堆临时文件，
+    而那段铺垫跟这些用例想说明的事情毫无关系。
+    """
+
+    def __init__(self, content: str = "1→hello", is_error: bool = False) -> None:
+        self._content = content
+        self._is_error = is_error
+
+    def name(self) -> str:
+        return "read_file"
+
+    def description(self) -> str:
+        return "假的读文件工具"
+
+    def parameters(self) -> dict[str, Any]:
+        return {
+            "type": "object",
+            "properties": {"path": {"type": "string"}},
+            "required": ["path"],
+        }
+
+    async def execute(self, args: str) -> Result:
+        return Result(self._content, is_error=self._is_error)
+
+
+def registry_with(*tools: StubTool) -> Registry:
+    registry = Registry()
+    for tool in tools:
+        registry.register(tool)
+    return registry
+
+
+def read_call(path: str = "a.py", call_id: str = "call_1") -> ToolCall:
+    """造一次 `read_file` 调用。"""
+    return ToolCall(id=call_id, name="read_file", input=json.dumps({"path": path}))
+
+
+def tool_round(preamble: str, path: str = "a.py") -> list[StreamEvent]:
+    """一轮「模型说了 preamble → 调一个工具 → 流结束」的脚本。"""
+    events = []
+    if preamble:
+        events.append(StreamEvent(text=preamble))
+    events += [StreamEvent(tool_calls=[read_call(path)]), StreamEvent(done=True)]
+    return events
+
+
+def with_app(
+    providers: list[ProviderConfig],
+    scenario: Scenario,
+    registry: Registry | None = None,
+) -> None:
+    """起一个 App 跑一遍 scenario，跑完自动收摊。
+
+    `registry` 默认给一个**空**的注册中心：界面测试要的是确定性，不该让假 provider
+    真去读磁盘。需要工具分派的用例自己传一个带假工具的进来。
+    """
 
     async def main() -> None:
-        app = QicodeApp(providers)
+        app = QicodeApp(providers, registry if registry is not None else Registry())
         async with app.run_test(size=(80, 24)) as pilot:
             await scenario(app, pilot)
 
@@ -54,6 +115,17 @@ def screen_text(app: QicodeApp) -> str:
 def screen_lines(app: QicodeApp) -> list[str]:
     """整屏按行切开，用来断言「谁和谁落在同一行」。"""
     return screen_text(app).split("\n")
+
+
+def conversation_blocks(app: QicodeApp) -> list[object]:
+    """对话区里**属于对话**的块，按它们在屏幕上的顺序。
+
+    跳过启动横幅和用户输入那一行（两者都是 `Static`）——用例关心的是助手回复和
+    工具块的**次序**，那两行每轮都在场，混进来只会让每条断言都多两个噪声元素，
+    还得随手指数组下标。
+    """
+    log = app.query_one("#log", VerticalScroll)
+    return [c for c in log.children if isinstance(c, (ReplyBlock, ToolBlock))]
 
 
 async def finish_turn(app: QicodeApp, pilot: Pilot) -> None:
@@ -532,6 +604,202 @@ def test_multi_turn_history_is_passed_to_provider(make_config, make_provider) ->
         ]
 
     with_app([make_config()], scenario)
+
+
+# ────────────────────────── 工具轮（F5、F8、F9）──────────────────────────
+
+
+def test_tool_round_renders_preamble_tool_row_then_final_reply(
+    make_config, make_provider
+) -> None:
+    """一轮工具对话在对话区留下**三个**块：开场白 → 工具行 → 最终答复。
+
+    这一条钉的是**顺序**：界面就按事件到达顺序 `mount`，顺序错了用户看到的
+    就是另一个故事（比如工具行跑到开场白上面去）。
+    """
+    final = "a.py 里写着 hello"
+
+    async def scenario(app: QicodeApp, pilot: Pilot) -> None:
+        app.provider = make_provider(
+            [
+                tool_round("我读一下 a.py"),
+                [StreamEvent(text=final), StreamEvent(done=True)],
+            ]
+        )
+        app.submit("看看 a.py")
+        await finish_turn(app, pilot)
+
+        # 断言类型而不是类名的字符串：类改名时这里会跟着一起改，不会悄悄失效。
+        assert [type(b) for b in conversation_blocks(app)] == [
+            ReplyBlock,
+            ToolBlock,
+            ReplyBlock,
+        ]
+
+        screen = screen_text(app)
+        assert "我读一下 a.py" in screen  # 开场白定住了，没被最终答复冲掉
+        assert 'read_file({"path": "a.py"})' in screen  # 调用行
+        assert "1→hello" in screen  # 结果摘要
+        assert final in screen
+
+    with_app([make_config()], scenario, registry_with(StubTool()))
+
+
+def test_tool_round_writes_the_history_exactly_once(make_config, make_provider) -> None:
+    """历史由 **agent** 写，界面一个字都不写（`docs/v2/plan.md`「历史由谁写」）。
+
+    v1 是界面在 `_finish_with_assistant` 里 `conv.add_assistant(reply)`；v2 改成
+    agent 写之后，如果那句没删干净，同一句答复会在历史里出现两次——而下一轮请求
+    就会带着重复的上下文发出去，模型看着像「自己刚说过两遍」。
+    所以这里数的是**条数**，不只是「有没有」。
+    """
+    final = "a.py 里写着 hello"
+
+    async def scenario(app: QicodeApp, pilot: Pilot) -> None:
+        fake = make_provider(
+            [
+                tool_round("我读一下 a.py"),
+                [StreamEvent(text=final), StreamEvent(done=True)],
+            ]
+        )
+        app.provider = fake
+        app.submit("看看 a.py")
+        await finish_turn(app, pilot)
+
+        assert [m.role for m in app.conv.messages()] == [
+            "user",
+            "assistant",
+            "tool",
+            "assistant",
+        ]
+        assert [m.content for m in app.conv.messages()].count(final) == 1
+
+        # 第二轮**又发了一次请求**，那一次带着完整的五条历史（F6）——
+        # 重复的话这里会多出来一条 assistant。
+        app.submit("再说一遍")
+        await finish_turn(app, pilot)
+        # 取**最后一次**请求而不是 `calls[1]`：第一轮本身就发了两次请求
+        # （工具前一次、工具后一次），第二条是那个「工具后」的历史，不是这一轮的。
+        assert [m.role for m in fake.calls[-1]] == [
+            "user",
+            "assistant",
+            "tool",
+            "assistant",
+            "user",
+        ]
+
+    with_app([make_config()], scenario, registry_with(StubTool()))
+
+
+def test_empty_preamble_leaves_no_blank_reply_block(make_config, make_provider) -> None:
+    """模型没说开场白就直接调工具时，那个空块要被摘掉。
+
+    空块是 `submit` 时开的（为了在首个增量到达前显示转轮），正文一个字都没有。
+    留着的话对话区里就是一个孤零零的圆点——用户看不出那是什么。
+    """
+    final = "读完了"
+
+    async def scenario(app: QicodeApp, pilot: Pilot) -> None:
+        app.provider = make_provider(
+            [tool_round(""), [StreamEvent(text=final), StreamEvent(done=True)]]
+        )
+        app.submit("看看 a.py")
+        await finish_turn(app, pilot)
+
+        # `remove()` 是**排队**的（不在这一帧当场摘），所以下面这条断言能过，
+        # 本身就说明那条摘除消息已经被处理掉了——`finish_turn` 里的 `pilot.pause()`
+        # 会把待处理的消息跑完。根本没摘的话，这里会多出一个空的 `ReplyBlock`。
+        assert [type(b) for b in conversation_blocks(app)] == [ToolBlock, ReplyBlock]
+        assert final in screen_text(app)
+
+    with_app([make_config()], scenario, registry_with(StubTool()))
+
+
+def test_tool_error_result_is_shown_instead_of_the_reply(make_config, make_provider):
+    """工具失败时，那条结构化错误**照常显示**在结果行里（F9、AC11）。
+
+    失败走的是结果通道而不是异常（N4），界面上因此是一个正常的工具块——
+    只是内容是一句错误说明。会话不中断，下一轮照常能发。
+    """
+
+    async def scenario(app: QicodeApp, pilot: Pilot) -> None:
+        app.provider = make_provider(
+            [
+                tool_round("我读一下"),
+                [StreamEvent(text="那我换个办法"), StreamEvent(done=True)],
+            ]
+        )
+        app.submit("看看 a.py")
+        await finish_turn(app, pilot)
+
+        screen = screen_text(app)
+        assert "未知工具: read_file" in screen  # 注册中心里没登记这个工具
+        assert "那我换个办法" in screen
+        assert app.state is SessionState.IDLE
+
+    # 故意传空注册中心：走的是**真实的**「未知工具」分支，不造假。
+    with_app([make_config()], scenario)
+
+
+def test_tool_limit_message_gets_its_own_block(make_config, make_provider) -> None:
+    """工具跑完、模型还想接着调 → 提示得**画得出来**。
+
+    这是「错误发生在工具块之后」那个时机：那一刻没有正在写的回复块
+    （`_streaming` 是 None），不现开一块的话这条提示就没有落点——
+    用户只看到一个跑完的工具块，然后界面回到空闲，完全不知道刚才发生了什么。
+    """
+
+    async def scenario(app: QicodeApp, pilot: Pilot) -> None:
+        app.provider = make_provider(
+            [
+                tool_round(""),
+                [
+                    StreamEvent(tool_calls=[read_call("b.py", "call_2")]),
+                    StreamEvent(done=True),
+                ],
+            ]
+        )
+        app.submit("先读 a 再读 b")
+        await finish_turn(app, pilot)
+
+        screen = screen_text(app)
+        assert "一轮只执行一次" in screen
+        assert app.state is SessionState.IDLE
+        # 提示归提示，第二个工具确实没跑（AC9），历史里也没有那一条。
+        assert [m.role for m in app.conv.messages()] == ["user", "assistant", "tool"]
+
+    with_app([make_config()], scenario, registry_with(StubTool()))
+
+
+def test_thinking_provider_says_tools_are_unavailable(make_config) -> None:
+    """开了 thinking 的接入点，一进去就说清楚工具用不了。
+
+    这是**真**构造一个 `AnthropicProvider`（不开网络，只建客户端）：只有走真路径，
+    `supports_tools` 那条「thinking 与工具本阶段互斥」的判断才真的被验到。
+    """
+    from qicode.tui.app import TOOLS_UNAVAILABLE
+
+    async def scenario(app: QicodeApp, pilot: Pilot) -> None:
+        assert app.provider is not None
+        assert app.provider.supports_tools is False, (
+            "前提不成立：这个接入点居然支持工具"
+        )
+        assert TOOLS_UNAVAILABLE in screen_text(app)
+
+    with_app([make_config(protocol="anthropic", thinking=True)], scenario)
+
+
+def test_tools_available_provider_gets_no_hint(make_config) -> None:
+    """反过来也要验：工具可用时**不许**出现那一行，不然上面那条可能只是永远显示。"""
+
+    async def scenario(app: QicodeApp, pilot: Pilot) -> None:
+        from qicode.tui.app import TOOLS_UNAVAILABLE
+
+        assert app.provider is not None
+        assert app.provider.supports_tools is True
+        assert TOOLS_UNAVAILABLE not in screen_text(app)
+
+    with_app([make_config(protocol="anthropic", thinking=False)], scenario)
 
 
 # ────────────────────────── 错误恢复（F11）──────────────────────────

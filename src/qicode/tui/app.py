@@ -1,7 +1,12 @@
 """`QicodeApp`：界面装配、状态机与消息处理（F2、F7、F9、F10、F11、F12；N1、N7）。
 
-分工：这个文件只管「界面怎么摆、状态怎么转、消息怎么接」，
-纯逻辑分别放在 `view.py`（渲染）、`stream.py`（流式驱动）、`select.py`（选择映射）。
+分工：这个文件只管「界面怎么摆、状态怎么转、事件怎么接」，纯逻辑分别放在
+`view.py`（渲染）、`select.py`（选择映射）、`qicode.agent`（单轮闭环：调不调工具、
+工具怎么执行）里。
+
+v2 起界面**不再写历史**：`Conversation` 由 `qicode.agent` 独家负责，这一层退化成
+纯渲染器（`docs/v2/plan.md`「历史由谁写」）。理由是一轮里有 preamble / 工具结果 /
+最终答复三条要按**各自的协议格式**入历史，散在渲染层必然写乱。
 """
 
 import asyncio
@@ -11,6 +16,7 @@ from enum import Enum
 from typing import ClassVar
 
 from rich.console import RenderableType
+from rich.text import Text
 from textual.app import App, ComposeResult
 from textual.binding import Binding, BindingType
 from textual.containers import Horizontal, VerticalScroll
@@ -20,21 +26,38 @@ from textual.widget import Widget
 from textual.widgets import OptionList, Static
 
 from qicode import __version__
+from qicode.agent import Agent, Event, Phase, ToolEvent
 from qicode.config import ProviderConfig
 from qicode.conversation import Conversation
 from qicode.llm import Provider, new_provider
 from qicode.redact import redact
+from qicode.tool import Registry
 from qicode.tui.select import build_options, pick
-from qicode.tui.stream import TICK_INTERVAL, consume
 from qicode.tui.view import (
+    DIM,
     MascotBanner,
     PromptArea,
     ReplyBlock,
+    ToolBlock,
     status_bar,
     user_block,
 )
 
 EXIT_COMMAND = "/exit"
+
+#: 计时刷新频率（秒）。0.1s = 10fps：秒数看着是连续跳的，「处理中」的转轮动画
+#: 也够顺，又不会把每一帧都变成一次界面重排。
+#:
+#: 它从 v1 的 `tui/stream.py` 搬来这里——那边整个模块被 `Agent` 取代了，而这一条
+#: 讲的纯粹是**界面多久重画一次**，本来就不属于流式那一层。
+TICK_INTERVAL = 0.1
+
+#: `supports_tools` 为假时，在对话区打的那一行提示。
+#:
+#: 必须有这一行：那种接入点压根收不到工具定义，用户让它读文件只会得到一句
+#: 「我做不到」，从界面上完全看不出是配置的原因。原因（本阶段 thinking 与工具
+#: 互斥）见 `docs/v2/plan.md`。
+TOOLS_UNAVAILABLE = "当前配置开启了 thinking，本阶段工具暂不可用"
 
 
 class SessionState(Enum):
@@ -128,7 +151,7 @@ class QicodeApp(App[None]):
     # 显隐和状态栏的同步只需要写一处，散在各处的状态赋值不必各自记得刷界面。
     state: reactive[SessionState] = reactive(SessionState.IDLE, init=False)
 
-    def __init__(self, providers: list[ProviderConfig]) -> None:
+    def __init__(self, providers: list[ProviderConfig], registry: Registry) -> None:
         super().__init__()
         if not providers:
             # `config.load` 已经挡过一道（providers 非空），但 QicodeApp 是公开类，
@@ -137,12 +160,22 @@ class QicodeApp(App[None]):
             raise ValueError("至少要有一个 provider 配置")
 
         self.providers = providers
+        #: 工具注册中心。界面**不直接用它**——它只是 `Agent` 的构造参数之一，
+        #: 存着是为了每轮新建 agent 时不用再问外面要一遍。
+        #:
+        #: 名字不叫 `_registry`：`App` 自己有一个同名的 `WeakSet`（存活控件的登记表，
+        #: 见 `App._close_all`），盖上去会把框架的内部状态弄坏——mypy 当场就能看出
+        #: 类型对不上，但那已经是在替框架报错了，不如一开始就换个名字。
+        self.tool_registry = registry
         self.provider: Provider | None = None
         self.conv = Conversation()
         self.cur_reply = ""
         self.turn_start = 0.0
         #: 本轮回复块（对话区里正在被流式写入的那个子节点）。本轮结束后置回 None。
         self._streaming: ReplyBlock | None = None
+        #: 本轮**正在执行**的那个工具块。`ev.tool` 的 START / END 两帧靠它配对；
+        #: 执行完立刻置回 None（那一块就此定型）。
+        self._cur_tool: ToolBlock | None = None
         self._stream_task: asyncio.Task[None] | None = None
         self._timer: Timer | None = None
 
@@ -193,12 +226,23 @@ class QicodeApp(App[None]):
         # `state` 用 init=False 且单 provider 时值没变（本来就是 IDLE），
         # watcher 不会触发，所以这里必须显式同步一次。
         self._sync_chrome()
+        self._warn_if_tools_unavailable()
 
         if self.state is SessionState.IDLE:
             # 必须显式给焦点：Textual 默认把焦点给第一个可聚焦的控件，而对话区
             # 那个 `VerticalScroll` 就是可聚焦的（`can_focus = True`）——那样用户
             # 一进来敲字是敲不到输入框里的。
             self.query_one("#input", PromptArea).focus()
+
+    def _warn_if_tools_unavailable(self) -> None:
+        """工具不可用时，在对话区明说一句（`TOOLS_UNAVAILABLE`）。
+
+        两处调用：`on_mount`（单条配置直接进对话）和 `_select_provider`（多条的选完之后）。
+        只看 `on_mount` 是不够的——多配置时那一刻 `self.provider` 还是 None，
+        等用户选完才有值，提示就漏了。
+        """
+        if self.provider is not None and not self.provider.supports_tools:
+            self._append(Text(TOOLS_UNAVAILABLE, style=DIM))
 
     def watch_state(self, _old: SessionState, _new: SessionState) -> None:
         self._sync_chrome()
@@ -269,7 +313,7 @@ class QicodeApp(App[None]):
             return
         log.anchor()
 
-    def _start_reply_block(self) -> None:
+    def _start_reply_block(self) -> ReplyBlock:
         """开一块空的回复块，作为流式文字的落点。
 
         这是整个「不跳版」的关键，值得说清楚。
@@ -284,10 +328,26 @@ class QicodeApp(App[None]):
 
         （版式为什么要做成两列，见 `ReplyBlock` 的类文档——那是踩了两次坑
         之后才定下来的。）
+
+        返回值就是刚建好的那块，省得调用方再 `self._streaming` 一次——
+        `_finish_with_error` 要按需补块，拿得到手更顺。
         """
         widget = ReplyBlock()
         self._streaming = widget
         self.query_one("#log", VerticalScroll).mount(widget)
+        return widget
+
+    def _start_tool_block(self) -> ToolBlock:
+        """开一块工具块，作为这次调用在对话区里的落点。
+
+        跟 `_start_reply_block` 同一个套路（直接 `mount()`、不 `await`，
+        理由见 `_append`）：挂上去之后它就是对话区最后一个子节点，
+        后面的增量自然会排在它下面。
+        """
+        widget = ToolBlock()
+        self._cur_tool = widget
+        self.query_one("#log", VerticalScroll).mount(widget)
+        return widget
 
     # ────────────────────────── 选择 provider ──────────────────────────
 
@@ -296,6 +356,7 @@ class QicodeApp(App[None]):
         event.stop()
         self.provider = new_provider(pick(self.providers, event.option.id))
         self.state = SessionState.IDLE
+        self._warn_if_tools_unavailable()
         self.query_one("#input", PromptArea).focus()
 
     # ────────────────────────── 提交与流式 ──────────────────────────
@@ -334,30 +395,96 @@ class QicodeApp(App[None]):
         self._start_reply_block()
         self._refresh_streaming()
 
-        # 起一个独立 task 跑流式：界面事件循环不被 await 卡住，
-        # 等待期间照样能滚动、能重绘（N1、AC13）。
-        self._stream_task = asyncio.create_task(self._consume_stream())
+        # 起一个独立 task 跑这一轮：界面事件循环不被 await 卡住，
+        # 等待期间照样能滚动、能重绘（N1、AC13）。取消也取消这个 task
+        # （见 `_quit`），`async for` 会把 CancelledError 一路送进适配器。
+        self._stream_task = asyncio.create_task(self._consume_agent_events())
         self._timer = self.set_interval(TICK_INTERVAL, self._tick)
 
-    async def _consume_stream(self) -> None:
+    async def _consume_agent_events(self) -> None:
+        """跑完一轮闭环，把 `Agent` 的事件流翻译成界面动作（F8、F9、F11）。
+
+        **这一层不写历史**——`Agent` 已经写过了（`docs/v2/plan.md`「历史由谁写」）。
+        v1 在这里既收流又 `conv.add_assistant(...)`，v2 只负责画。
+        """
         provider = self.provider
         if provider is None:
             # 状态机不该允许这种组合；真出现也照样走错误路径，不抛。
             self._finish_with_error(RuntimeError("还没有选定 provider"))
             return
 
-        await consume(
-            provider,
-            self.conv.messages(),
-            on_text=self._on_delta,
-            on_done=self._finish_with_assistant,
-            on_error=self._finish_with_error,
-        )
+        try:
+            async for event in Agent(provider, self.tool_registry).run(self.conv):
+                self._on_agent_event(event)
+        except asyncio.CancelledError:
+            # 用户按 Esc / Ctrl+C 时走这里。取消靠异常传播，**吞掉就等于把取消吞掉了**
+            # （`agent.Agent.run` 的文档），这里只负责让它继续往上走。
+            raise
+        except Exception as exc:  # noqa: BLE001
+            # agent 内部已经把适配器失败和工具失败都翻成了事件，能到这里的是**我们
+            # 没料到的**异常（多半是界面自己抛的）。同样翻成错误收尾，不让它冒出去
+            # 打崩 App——v1 的 `stream.consume` 也是这么兜的，这条边界不能因为换了一层
+            # 就撤掉。
+            self._finish_with_error(exc)
 
-    def _on_delta(self, text: str) -> None:
-        """收到一段正文增量：累加并立刻重绘（F8 的「逐字」观感）。"""
-        self.cur_reply += text
-        self._refresh_streaming()
+    def _on_agent_event(self, event: Event) -> None:
+        """按 `Event` 里**非 None 的那个字段**分派（`docs/v2/plan.md` 的分派表）。
+
+        四态互斥，顺序无所谓，但工具那一支要走两条路（START / END），所以单独拎出来。
+        """
+        if event.tool is not None:
+            if event.tool.phase is Phase.START:
+                self._begin_tool(event.tool)
+            else:
+                self._finish_tool(event.tool)
+        elif event.text:
+            if self._streaming is None:
+                # 两种时候会走到这：本轮的**第一段**正文（`submit` 已经开过块了，
+                # 所以只有刚跑完工具时才会为空），以及工具之后的新一段。
+                self._start_reply_block()
+            self.cur_reply += event.text
+            self._refresh_streaming()
+        elif event.done:
+            self._finish_with_assistant()
+        elif event.err is not None:
+            self._finish_with_error(event.err)
+
+    def _begin_tool(self, tool: ToolEvent) -> None:
+        """一个工具开始执行：先把当前回复块**定型**，再挂上工具块（F8）。
+
+        定型这一步是 preamble 的落点：模型常常先说一句「我读一下 a.py」再去调工具，
+        那句话属于这一轮的开场白，得留在对话区，不能等最终答复出来时被冲掉。
+
+        反过来，preamble 是**空的**时候要把那个块摘掉——它是 `submit` 时开的
+        （为了在首个增量到达前显示转轮），模型一个字没说就直接调了工具，
+        留着就是一个孤零零的圆点。
+        """
+        block = self._streaming
+        self._streaming = None
+        if block is not None:
+            if self.cur_reply.strip():
+                block.show_reply(self.cur_reply, time.monotonic() - self.turn_start)
+            else:
+                # 不 await：`remove()` 把摘除动作排给下一条消息，这里不等它。
+                # 摘除和下面这次 mount 会落在同一帧里（中间没有一次重绘），
+                # 所以不会看见「空块和工具块同时在场」的中间态。
+                block.remove()
+        self.cur_reply = ""
+
+        self._start_tool_block().show_running(tool.name, tool.args)
+        self._follow_tail()
+
+    def _finish_tool(self, tool: ToolEvent) -> None:
+        """一个工具执行完：把结果摘要挂到它那一块下面，这一块就此定型（AC11）。
+
+        后面要是还有正文，`_on_agent_event` 会另开一个新的回复块——所以这里
+        除了把 `_cur_tool` 放掉，不需要再做别的。
+        """
+        if self._cur_tool is None:
+            # 没经过 START 的 END 不该出现（agent 保证成对）；真出现也不崩。
+            return
+        self._cur_tool.show_result(tool.name, tool.args, tool.result, tool.is_error)
+        self._cur_tool = None
 
     def _tick(self) -> None:
         """定时刷新计时与转轮（F12、N2）。"""
@@ -366,36 +493,54 @@ class QicodeApp(App[None]):
         self._refresh_streaming()
 
     def _refresh_streaming(self) -> None:
+        """把「此刻正在进行的那件事」重画一帧（F12、N2）。
+
+        两种落点：正在跑工具就刷工具块，否则刷回复块。两者不会同时存在——
+        `_begin_tool` 定型回复块之后才开工具块，`_finish_tool` 之后下一次正文增量
+        才会再开回复块。
+
+        转轮那一帧只对**还没定型**的块有效（`ToolBlock.show_progress` 自己会跳过），
+        所以这里不需要再判一次。
+        """
+        elapsed = time.monotonic() - self.turn_start
+
+        if self._cur_tool is not None:
+            self._cur_tool.show_progress(elapsed)
+            return
+
         if self._streaming is None:
             return
-        self._streaming.show_streaming(
-            self.cur_reply, time.monotonic() - self.turn_start
-        )
+        self._streaming.show_streaming(self.cur_reply, elapsed)
         # 回复块每长一行都可能把内容顶出视口——那是「开始跟随」的临界点。
         self._follow_tail()
 
     def _finish_with_assistant(self) -> None:
-        """本轮正常结束：定型渲染 + 入历史（F8、F12、F6）。"""
-        elapsed = time.monotonic() - self.turn_start
-        reply = self.cur_reply
+        """本轮正常结束：定型渲染（F8、F12）。
+
+        **这里不写历史**（v1 在这个函数里 `self.conv.add_assistant(reply)`）：
+        agent 已经写过了，两边都写的话同一句答复会在历史里出现两次，
+        下一轮请求就会带着重复的上下文发出去。
+
+        空回复的处理也交给了 agent：它压根不会发 `done`，而是发一条带
+        `EMPTY_REPLY` / `TOOL_LIMIT` 的 `err` 事件，走 `_finish_with_error`。
+        所以走到这里时 `cur_reply` 必定非空。
+        """
         block = self._streaming
-
-        if reply.strip():
-            if block is not None:
-                block.show_reply(reply, elapsed)
-            self.conv.add_assistant(reply)
-        elif block is not None:
-            # 空回复**不进历史**。Anthropic 对 content 为空的消息直接返回 400，
-            # 把它存进去会让**下一轮**莫名其妙地失败，而用户完全看不出这跟上一轮有关。
-            # 与其埋一颗这种雷，不如当场把这一轮标成失败。
-            block.show_error("模型返回了空回复")
-
+        if block is not None:
+            block.show_reply(self.cur_reply, time.monotonic() - self.turn_start)
         self._end_turn()
 
     def _finish_with_error(self, err: Exception) -> None:
-        """本轮失败：对话区标红，**不退出**（F11、AC11）。"""
-        if self._streaming is not None:
-            self._streaming.show_error(self._safe_message(err))
+        """本轮失败：对话区标红，**不退出**（F11、AC11）。
+
+        没有正在写的回复块时（比如工具跑完、模型却没给最终答复）得**现开一块**——
+        否则这条错误提示没有落点，用户只会看到一个跑完的工具块然后界面回到空闲，
+        完全不知道刚才发生了什么。
+        """
+        block = self._streaming
+        if block is None:
+            block = self._start_reply_block()
+        block.show_error(self._safe_message(err))
         self._end_turn()
 
     def _safe_message(self, err: Exception) -> str:
@@ -415,16 +560,17 @@ class QicodeApp(App[None]):
         return redact(str(err), [cfg.api_key for cfg in self.providers])
 
     def _end_turn(self) -> None:
-        """收尾：停表、放掉回复块、回空闲。
+        """收尾：停表、放掉各块的引用、回空闲。
 
-        这里**不清空**回复块——它已经被 `_finish_*` 换成定型内容了，从此就是
-        对话历史的一部分。所以只是把引用放开，让下一轮去 mount 新的。
+        这里**不清空**已经定型的块——它们已经被 `show_reply` / `show_result` 换成
+        最终内容了，从此就是对话历史的一部分。所以只是把引用放开，让下一轮去 mount 新的。
         """
         if self._timer is not None:
             self._timer.stop()
             self._timer = None
         self._stream_task = None
         self._streaming = None
+        self._cur_tool = None
         self.cur_reply = ""
         self.state = SessionState.IDLE
         # 定型后的 markdown 折行高度可能跟流式正文不一样，有可能**就在这一刻**

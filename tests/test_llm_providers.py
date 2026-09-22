@@ -17,12 +17,25 @@ from collections.abc import AsyncIterator, Sequence
 from types import SimpleNamespace
 from typing import Any, Self
 
+import openai
 import pytest
 
 from qicode.config import ProviderConfig
-from qicode.llm import Message, StreamEvent
-from qicode.llm.anthropic_provider import MAX_TOKENS, THINKING_PARAMS, AnthropicProvider
-from qicode.llm.openai_provider import OpenAIProvider
+from qicode.llm import (
+    Message,
+    StreamEvent,
+    ToolCall,
+    ToolDefinition,
+    ToolResult,
+    tool_input,
+)
+from qicode.llm.anthropic_provider import (
+    MAX_TOKENS,
+    THINKING_PARAMS,
+    AnthropicProvider,
+    _to_anthropic_messages,
+)
+from qicode.llm.openai_provider import OpenAIProvider, _to_sdk_messages
 from qicode.prompt import system_prompt
 
 
@@ -41,10 +54,17 @@ def make_cfg(**over: Any) -> ProviderConfig:
 
 
 async def collect(
-    provider: Any, msgs: Sequence[Message] | None = None
+    provider: Any,
+    msgs: Sequence[Message] | None = None,
+    tools: Sequence[ToolDefinition] | None = None,
 ) -> list[StreamEvent]:
     """把整条流收成一个列表。"""
-    return [ev async for ev in provider.stream(list(msgs or [Message("user", "嗨")]))]
+    return [
+        ev
+        async for ev in provider.stream(
+            list(msgs or [Message("user", "嗨")]), list(tools or [])
+        )
+    ]
 
 
 def inject(provider: Any, client: Any) -> None:
@@ -74,19 +94,40 @@ def thinking_delta(text: str) -> SimpleNamespace:
     )
 
 
+def tool_use_block(call_id: str, name: str, args: dict[str, Any]) -> SimpleNamespace:
+    """终态消息里的一个 `tool_use` 块（`input` 已经是解析好的对象）。"""
+    return SimpleNamespace(type="tool_use", id=call_id, name=name, input=args)
+
+
+def final_message(
+    blocks: Sequence[Any], stop_reason: str = "end_turn"
+) -> SimpleNamespace:
+    return SimpleNamespace(stop_reason=stop_reason, content=list(blocks))
+
+
 class FakeAnthropicStream:
     """`client.messages.stream(...)` 返回的那个上下文管理器。
 
     `hang=True` 时，吐完脚本里的事件就永远卡住——用来模拟「正等着下一个增量」的
     那一刻，好让取消真的落在适配器内部的 await 上。
+
+    另外要能交出 `get_final_message()`：适配器在流读完之后靠它取这一轮的
+    `stop_reason` 和内容块（工具调用就在里面）。这是 SDK 的既有接口，不是我们
+    自创的——照抄教程只用 `async for` 的话，工具调用会一个都收不到，因为
+    `input_json_delta` 只是参数碎片，完整对象只在终态消息里。
     """
 
     def __init__(
-        self, events: Sequence[Any], error: Exception | None = None, hang: bool = False
+        self,
+        events: Sequence[Any],
+        error: Exception | None = None,
+        hang: bool = False,
+        final: Any = None,
     ) -> None:
         self._events = events
         self._error = error
         self._hang = hang
+        self._final = final if final is not None else final_message([])
         self.closed = False
 
     async def __aenter__(self) -> Self:
@@ -104,13 +145,20 @@ class FakeAnthropicStream:
         if self._error is not None:
             raise self._error
 
+    async def get_final_message(self) -> Any:
+        return self._final
+
 
 class FakeAnthropicClient:
     def __init__(
-        self, events: Sequence[Any], error: Exception | None = None, hang: bool = False
+        self,
+        events: Sequence[Any],
+        error: Exception | None = None,
+        hang: bool = False,
+        final: Any = None,
     ) -> None:
         self.params: dict[str, Any] | None = None
-        self.stream_obj = FakeAnthropicStream(events, error, hang)
+        self.stream_obj = FakeAnthropicStream(events, error, hang, final)
         self.messages = SimpleNamespace(stream=self._stream)
 
     def _stream(self, **params: Any) -> FakeAnthropicStream:
@@ -119,10 +167,10 @@ class FakeAnthropicClient:
 
 
 def anthropic_with(
-    events: Sequence[Any], **cfg_over: Any
+    events: Sequence[Any], final: Any = None, **cfg_over: Any
 ) -> tuple[AnthropicProvider, FakeAnthropicClient]:
     provider = AnthropicProvider(make_cfg(**cfg_over))
-    fake = FakeAnthropicClient(events)
+    fake = FakeAnthropicClient(events, final=final)
     inject(provider, fake)
     return provider, fake
 
@@ -130,12 +178,40 @@ def anthropic_with(
 # ────────────────────────── 假件：OpenAI 兼容 ──────────────────────────
 
 
-def chunk(content: str | None, choices: int = 1) -> SimpleNamespace:
+def chunk(
+    content: str | None, choices: int = 1, tool_calls: Sequence[Any] | None = None
+) -> SimpleNamespace:
+    """一个流式分块。
+
+    `delta` 上**始终**带 `tool_calls`（哪怕用不着）：真实的 SDK 是 pydantic 模型，
+    这个字段永远存在，默认 None。假件少写一个字段，适配器就会在 AttributeError 上
+    栽跟头，而那只会污染别的用例的结论。
+    """
     return SimpleNamespace(
         choices=[
-            SimpleNamespace(delta=SimpleNamespace(content=content))
+            SimpleNamespace(
+                delta=SimpleNamespace(content=content, tool_calls=tool_calls)
+            )
             for _ in range(choices)
         ]
+    )
+
+
+def tc_delta(
+    index: int,
+    call_id: str | None = None,
+    name: str | None = None,
+    args: str | None = None,
+) -> SimpleNamespace:
+    """一片工具调用增量。
+
+    三段的到达规律不一样，这正是不容易写对的地方：`id` / `name` **只在第一片**里
+    出现，`arguments` 则每片都是一段、必须首尾相接拼起来。
+    """
+    return SimpleNamespace(
+        index=index,
+        id=call_id,
+        function=SimpleNamespace(name=name, arguments=args),
     )
 
 
@@ -436,7 +512,7 @@ def test_early_break_still_closes_the_stream(protocol: str) -> None:
 
     async def half() -> list[str]:
         got = []
-        async for ev in provider.stream([Message("user", "嗨")]):
+        async for ev in provider.stream([Message("user", "嗨")], []):
             if ev.text:
                 got.append(ev.text)
                 break  # 只读一个增量就走人
@@ -470,7 +546,7 @@ def test_cancellation_is_not_swallowed(protocol: str) -> None:
 
     async def run() -> None:
         async def consume() -> None:
-            async for ev in provider.stream([Message("user", "嗨")]):
+            async for ev in provider.stream([Message("user", "嗨")], []):
                 seen.append(ev)
 
         task = asyncio.create_task(consume())
@@ -486,3 +562,461 @@ def test_cancellation_is_not_swallowed(protocol: str) -> None:
     # 而用户只是自己打断了它。
     assert [ev.text for ev in seen] == ["一"]
     assert not any(ev.err is not None for ev in seen)
+
+
+# ────────────────── 工具调用参数的解析兜底（`docs/v2/checklist.md` T1 那条） ──────────────────
+
+
+def test_tool_input_parses_a_well_formed_object() -> None:
+    call = ToolCall(id="call_1", name="read_file", input='{"path": "a.py"}')
+
+    assert tool_input(call) == {"path": "a.py"}
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        "不是 json",  # 模型偶尔真的会发出这种
+        '{"path": "a.py"',  # 截断
+        '{"a": 1,}',  # 多一个逗号
+        "[1, 2]",  # 合法 JSON，但不是对象
+        "null",
+        "",
+    ],
+)
+def test_tool_input_never_raises(raw: str) -> None:
+    """回灌路径上**不许抛**（N4）。
+
+    Anthropic 的 `tool_use` 块要的 `input` 是一个对象，适配器必须 `json.loads` 一次。
+    那一下要是抛出去，崩的不是一条工具调用，而是**整轮请求**——界面上会变成一句
+    看不懂的异常。所以解析不出来就给个空对象：工具侧本来就已经回了「参数不是合法
+    JSON」的结构化错误，两边正好对得上。
+    """
+    call = ToolCall(id="call_1", name="read_file", input=raw)
+
+    assert tool_input(call) == {}
+
+
+# ────────────────── 工具定义注入（T10；F3、F7） ──────────────────
+
+
+def tool_def(name: str = "read_file") -> ToolDefinition:
+    return ToolDefinition(
+        name=name,
+        description="读文件",
+        input_schema={
+            "type": "object",
+            "properties": {"path": {"type": "string"}},
+            "required": ["path"],
+        },
+    )
+
+
+def test_anthropic_sends_tools_with_input_schema() -> None:
+    """Anthropic 的字段叫 `input_schema`，而且**不套** `{"type": "function"}`。
+
+    和 OpenAI 侧长得像但两处都不同，是两条协议各自的规矩。抄错任何一个，
+    服务端都会以「参数不认识 / 缺字段」为由把整个请求打回去——不是工具失灵，
+    是这一轮根本发不出去。
+    """
+    provider, fake = anthropic_with([text_delta("好")])
+
+    asyncio.run(collect(provider, tools=[tool_def()]))
+
+    assert fake.params is not None
+    assert fake.params["tools"] == [
+        {
+            "name": "read_file",
+            "description": "读文件",
+            "input_schema": tool_def().input_schema,
+        }
+    ]
+
+
+def test_anthropic_omits_tools_when_none_given() -> None:
+    """没有工具就**不发**这个参数，而不是发一个空数组。"""
+    provider, fake = anthropic_with([text_delta("好")])
+
+    asyncio.run(collect(provider, tools=[]))
+
+    assert fake.params is not None
+    assert "tools" not in fake.params
+
+
+def test_openai_sends_tools_wrapped_in_function() -> None:
+    """OpenAI 侧要包一层 `{"type": "function"}`，参数字段叫 `parameters`。"""
+    provider, fake = openai_with([chunk("好")])
+
+    asyncio.run(collect(provider, tools=[tool_def()]))
+
+    assert fake.params is not None
+    assert fake.params["tools"] == [
+        {
+            "type": "function",
+            "function": {
+                "name": "read_file",
+                "description": "读文件",
+                "parameters": tool_def().input_schema,
+            },
+        }
+    ]
+
+
+def test_openai_omits_tools_via_the_sdk_sentinel() -> None:
+    """没有工具时传的是 SDK 的 `omit` 哨兵（「这个参数根本不要发」），不是空列表。
+
+    有些兼容网关对 `tools: []` 直接报错，所以「空就不发」这件事必须落到**不发**上，
+    而不只是「发了个空的」。
+    """
+    provider, fake = openai_with([chunk("好")])
+
+    asyncio.run(collect(provider, tools=[]))
+
+    assert fake.params is not None
+    assert fake.params["tools"] is openai.omit
+
+
+# ────────────────── supports_tools（T10；thinking 与工具互斥） ──────────────────
+
+
+@pytest.mark.parametrize(("thinking", "expected"), [(False, True), (True, False)])
+def test_anthropic_supports_tools_is_the_inverse_of_thinking(
+    thinking: bool, expected: bool
+) -> None:
+    """开了 thinking 就不能带工具——理由见 `qicode.llm.Provider.supports_tools`。
+
+    这条是**显式声明**：上层据它决定传不传 `tools`。适配器不会偷偷把 `tools` 丢掉，
+    那样用户只会看到「工具莫名其妙不工作」，无处可查。
+    """
+    assert AnthropicProvider(make_cfg(thinking=thinking)).supports_tools is expected
+
+
+def test_openai_supports_tools_regardless_of_thinking() -> None:
+    """这条链路本来就不发 thinking 参数（v1 的结论），所以工具一直可用。"""
+    cfg = make_cfg(protocol="openai", thinking=True)
+
+    assert OpenAIProvider(cfg).supports_tools is True
+
+
+# ────────────────── T11：anthropic 解析工具调用 ──────────────────
+
+
+def test_anthropic_yields_tool_calls_before_done() -> None:
+    """工具调用在 `done` **之前**一次性给全，上层才能「见 done 就收工」。
+
+    注意 `input` 是**字符串**（`ToolCall.input` 的约定），不是对象——
+    这里恰好是 dumps 回来的，看着像原样，其实那一步必须做。
+    """
+    final = final_message(
+        [tool_use_block("call_1", "read_file", {"path": "a.py"})],
+        stop_reason="tool_use",
+    )
+    provider, _ = anthropic_with([text_delta("我看一下")], final=final)
+
+    events = asyncio.run(collect(provider))
+
+    assert [ev.text for ev in events if ev.text] == ["我看一下"]
+    assert events[-2].tool_calls == [
+        ToolCall(id="call_1", name="read_file", input='{"path": "a.py"}')
+    ]
+    assert events[-1].done is True
+    assert events[-1].tool_calls == []
+
+
+def test_anthropic_finds_tool_calls_only_in_the_final_message() -> None:
+    """工具调用**不是**从流式增量里拼的，只在终态消息里取。
+
+    `input_json_delta` 只是参数碎片，自己拼容易错；SDK 的累加器已经把成品放在
+    `get_final_message()` 里了。这条用例正是钉住这个选择——把假流的事件里也塞一份
+    碎片，断言最终**只有**终态消息那一份被采纳。
+    """
+    fragments = [
+        SimpleNamespace(
+            type="content_block_delta",
+            delta=SimpleNamespace(type="input_json_delta", partial_json='{"path":'),
+        )
+    ]
+    final = final_message(
+        [tool_use_block("call_1", "read_file", {"path": "a.py"})],
+        stop_reason="tool_use",
+    )
+    provider, _ = anthropic_with([*fragments], final=final)
+
+    events = asyncio.run(collect(provider))
+
+    assert [ev.tool_calls for ev in events if ev.tool_calls] == [
+        [ToolCall(id="call_1", name="read_file", input='{"path": "a.py"}')]
+    ]
+
+
+def test_anthropic_ignores_tool_blocks_when_stop_reason_says_otherwise() -> None:
+    """`stop_reason` 不是 `tool_use` 就不执行——哪怕内容里躺着 tool_use 块。
+
+    `max_tokens` 截断时也会留下这种块，而它的 input 是**残缺**的。拿去执行只会
+    换来一句莫名其妙的参数错误，还不如让这一轮以正文结束，模型下一轮自己重来。
+    """
+    final = final_message(
+        [tool_use_block("call_1", "bash", {"command": "ls"})],
+        stop_reason="max_tokens",
+    )
+    provider, _ = anthropic_with([text_delta("话说到一半")], final=final)
+
+    events = asyncio.run(collect(provider))
+
+    assert not any(ev.tool_calls for ev in events)
+    assert events[-1].done is True
+
+
+# ────────────────── T11：anthropic 历史回灌 ──────────────────
+
+
+def test_anthropic_message_conversion_covers_all_three_rounds() -> None:
+    """三种回合的转换各断言一次（T11 的第 4 条）。
+
+    最要紧的是第三条：`tool_result` 进的是 **user** 消息。照 OpenAI 的习惯写成
+    `{"role": "tool"}` 的话，Anthropic 不认识这个角色，**整轮请求**当场失败。
+    """
+    sent = _to_anthropic_messages(
+        [
+            Message(role="user", content="看看"),
+            Message(
+                role="assistant",
+                content="我读一下",
+                tool_calls=[
+                    ToolCall(id="call_1", name="read_file", input='{"path": "a.py"}')
+                ],
+            ),
+            Message(
+                role="tool",
+                tool_results=[
+                    ToolResult(tool_call_id="call_1", content="内容", is_error=False)
+                ],
+            ),
+            Message(role="assistant", content="看完了"),
+        ]
+    )
+
+    assert sent[0] == {"role": "user", "content": "看看"}
+    assert sent[1] == {
+        "role": "assistant",
+        "content": [
+            {"type": "text", "text": "我读一下"},
+            {
+                "type": "tool_use",
+                "id": "call_1",
+                "name": "read_file",
+                # 对象，不是字符串——与 `ToolCall.input` 相反，这一步就是把它解回去。
+                "input": {"path": "a.py"},
+            },
+        ],
+    }
+    assert sent[2] == {
+        "role": "user",  # ← 协议规定，不是笔误
+        "content": [
+            {
+                "type": "tool_result",
+                "tool_use_id": "call_1",
+                "content": "内容",
+                "is_error": False,
+            }
+        ],
+    }
+    assert sent[3] == {"role": "assistant", "content": "看完了"}
+
+
+def test_anthropic_skips_the_text_block_when_preamble_is_empty() -> None:
+    """只调工具、一句话不说时，**不能**塞一个空的 text 块。
+
+    服务端会以 `text content blocks must be non-empty` 直接 400。空正文就整个不放，
+    此时 content 数组里只剩 tool_use 块，这是合法的。
+    """
+    sent = _to_anthropic_messages(
+        [
+            Message(
+                role="assistant",
+                content="",
+                tool_calls=[ToolCall(id="c", name="bash", input="{}")],
+            )
+        ]
+    )
+
+    assert sent[0]["content"] == [
+        {"type": "tool_use", "id": "c", "name": "bash", "input": {}}
+    ]
+
+
+@pytest.mark.parametrize("bad", ["不是 json", '{"path": "a.py"', "[1, 2]", ""])
+def test_anthropic_replay_survives_illegal_tool_input(bad: str) -> None:
+    """回灌路径**不许抛**（N4）。
+
+    这里要的是对象，所以必须解析一次；模型偶尔真的会发出非法 JSON。那一下要是抛
+    出去，崩的不是一条工具调用，而是**整轮请求**。给个空对象即可——工具侧本来
+    就已经回了「参数不是合法 JSON」的结构化错误，两边正好对得上。
+    """
+    sent = _to_anthropic_messages(
+        [
+            Message(
+                role="assistant",
+                content="",
+                tool_calls=[ToolCall(id="c", name="bash", input=bad)],
+            )
+        ]
+    )
+
+    assert sent[0]["content"][0]["input"] == {}
+
+
+# ────────────────── T12：openai 解析工具调用 ──────────────────
+
+
+def test_openai_accumulates_interleaved_tool_call_fragments() -> None:
+    """两个工具的**分片交错**到达，也要各自拼对。
+
+    真实的到达顺序就是这样：先给每个工具的 id/name，然后 arguments 一段一段来。
+    按 index 归拢是唯一拼得对的办法——按到达顺序拼，两个工具的参数会搅在一起。
+    """
+    provider, _ = openai_with(
+        [
+            chunk(None, tool_calls=[tc_delta(0, call_id="c1", name="read_file")]),
+            chunk(None, tool_calls=[tc_delta(1, call_id="c2", name="bash")]),
+            chunk(None, tool_calls=[tc_delta(0, args='{"path":')]),
+            chunk(None, tool_calls=[tc_delta(1, args='{"command": "ls"}')]),
+            chunk(None, tool_calls=[tc_delta(0, args=' "a.py"}')]),
+        ]
+    )
+
+    events = asyncio.run(collect(provider))
+
+    calls = events[-2].tool_calls
+    assert [c.id for c in calls] == ["c1", "c2"]
+    assert [c.name for c in calls] == ["read_file", "bash"]
+    assert calls[0].input == '{"path": "a.py"}'
+    assert calls[1].input == '{"command": "ls"}'
+    assert events[-1].done is True
+
+
+def test_openai_output_order_follows_index_not_arrival() -> None:
+    """输出按 index 排序，不按到达顺序——顺序飘忽会让「模型看到的调用顺序」
+    和「它自己发起的顺序」对不上，回灌下去它就对不上账。"""
+    provider, _ = openai_with(
+        [
+            chunk(None, tool_calls=[tc_delta(1, call_id="c2", name="bash")]),
+            chunk(None, tool_calls=[tc_delta(0, call_id="c1", name="read_file")]),
+        ]
+    )
+
+    events = asyncio.run(collect(provider))
+
+    assert [c.id for c in events[-2].tool_calls] == ["c1", "c2"]
+
+
+def test_openai_normalises_empty_arguments() -> None:
+    """无参工具的 arguments 是空串（连分片都没有），回灌时必须是合法 JSON。
+
+    `"arguments": ""` 会被严格端点判成 400，所以归一到 `"{}"`（`docs/v2/plan.md`
+    「空参数归一」）。
+    """
+    provider, _ = openai_with(
+        [chunk(None, tool_calls=[tc_delta(0, call_id="c1", name="bash")])]
+    )
+
+    events = asyncio.run(collect(provider))
+
+    assert events[-2].tool_calls[0].input == "{}"
+
+
+def test_openai_ignores_a_truncated_fragment_without_id_or_name() -> None:
+    """网关把第一片（带 id/name 的那片）吞了时，不能丢一句看不懂的 KeyError。
+
+    给空串走正常路径：空 name 在注册中心那里会变成一条「未知工具」的结构化错误，
+    模型看得懂，会话照常继续。
+    """
+    provider, _ = openai_with([chunk(None, tool_calls=[tc_delta(0, args="{}")])])
+
+    events = asyncio.run(collect(provider))
+
+    assert events[-2].tool_calls == [ToolCall(id="", name="", input="{}")]
+    assert events[-1].done is True
+
+
+def test_openai_no_tool_calls_means_no_event() -> None:
+    """纯文本回合不该冒出一个空的 tool_calls 事件。"""
+    provider, _ = openai_with([chunk("你好")])
+
+    events = asyncio.run(collect(provider))
+
+    assert not any(ev.tool_calls for ev in events)
+    assert events[-1].done is True
+
+
+# ────────────────── T12：openai 历史回灌 ──────────────────
+
+
+def test_openai_message_conversion_covers_all_three_rounds() -> None:
+    """三种回合各断言一次。注意工具结果那一条与前两种**不是一条对一条**：
+    几个结果就发几条 `{"role": "tool"}`，一个回合展开成了两条消息。"""
+    sent = _to_sdk_messages  # 先取个短名，下面按回合分开调，好逐条断言
+    user = sent(Message(role="user", content="看看"))
+    assistant_calls = sent(
+        Message(
+            role="assistant",
+            content="我读一下",
+            tool_calls=[
+                ToolCall(id="c1", name="read_file", input='{"path": "a.py"}'),
+                ToolCall(id="c2", name="bash", input="{}"),
+            ],
+        )
+    )
+    tool_round = sent(
+        Message(
+            role="tool",
+            tool_results=[
+                ToolResult(tool_call_id="c1", content="内容", is_error=False),
+                ToolResult(tool_call_id="c2", content="出错了", is_error=True),
+            ],
+        )
+    )
+    plain_assistant = sent(Message(role="assistant", content="看完了"))
+
+    assert user == [{"role": "user", "content": "看看"}]
+    assert assistant_calls == [
+        {
+            "role": "assistant",
+            "content": "我读一下",
+            "tool_calls": [
+                {
+                    "id": "c1",
+                    "type": "function",
+                    "function": {"name": "read_file", "arguments": '{"path": "a.py"}'},
+                },
+                {
+                    "id": "c2",
+                    "type": "function",
+                    "function": {"name": "bash", "arguments": "{}"},
+                },
+            ],
+        }
+    ]
+    assert tool_round == [
+        {"role": "tool", "tool_call_id": "c1", "content": "内容"},
+        {"role": "tool", "tool_call_id": "c2", "content": "出错了"},
+    ]
+    assert plain_assistant == [{"role": "assistant", "content": "看完了"}]
+
+
+def test_openai_sends_null_content_for_an_empty_preamble() -> None:
+    """只调工具、不说话时正文发 `null`，不是 `""`。
+
+    协议里 `null` 才是「这条没有正文」；有的严格实现会把空串当成一轮空回复。
+    """
+    sent = _to_sdk_messages(
+        Message(
+            role="assistant",
+            content="",
+            tool_calls=[ToolCall(id="c", name="bash", input="")],
+        )
+    )
+
+    assert sent[0]["content"] is None
+    # 顺带把另一处归一钉住：空的 arguments 回灌时必须是 `"{}"`，不能是 `""`。
+    assert sent[0]["tool_calls"][0]["function"]["arguments"] == "{}"

@@ -8,6 +8,7 @@ import yaml
 
 from qicode.cli import main
 from qicode.conversation import Conversation
+from qicode.tool import Registry
 
 
 def test_missing_config_exits_with_readable_message(tmp_path, monkeypatch, capsys):
@@ -83,8 +84,9 @@ def test_valid_config_starts_the_app(tmp_path, monkeypatch):
     started: list[object] = []
 
     class FakeApp:
-        def __init__(self, providers: object) -> None:
+        def __init__(self, providers: object, registry: Registry) -> None:
             started.append(providers)
+            started.append(registry)
             self.conv = Conversation()
 
         def run(self) -> None:
@@ -99,6 +101,16 @@ def test_valid_config_starts_the_app(tmp_path, monkeypatch):
     providers = started[0]
     assert isinstance(providers, list)
     assert providers[0].name == "anthropic"
+    # 工具注册中心是在 cli 这一层建好的，六个核心工具一个不少（F2）。
+    registry = started[1]
+    assert [d.name for d in registry.definitions()] == [
+        "read_file",
+        "write_file",
+        "edit_file",
+        "bash",
+        "glob",
+        "grep",
+    ]
 
 
 def test_transcript_is_replayed_after_exit(tmp_path, monkeypatch, capsys):
@@ -125,7 +137,7 @@ def test_transcript_is_replayed_after_exit(tmp_path, monkeypatch, capsys):
     monkeypatch.chdir(tmp_path)
 
     class FakeApp:
-        def __init__(self, providers: object) -> None:
+        def __init__(self, providers: object, registry: Registry) -> None:
             self.conv = Conversation()
             self.conv.add_user("我叫居居")
             self.conv.add_assistant("记住了。")
@@ -165,7 +177,7 @@ def test_nothing_is_replayed_when_nothing_was_said(tmp_path, monkeypatch, capsys
     monkeypatch.chdir(tmp_path)
 
     class FakeApp:
-        def __init__(self, providers: object) -> None:
+        def __init__(self, providers: object, registry: Registry) -> None:
             self.conv = Conversation()
 
         def run(self) -> None:

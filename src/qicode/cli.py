@@ -9,6 +9,7 @@ import sys
 from rich.console import Console
 
 from qicode.config import ConfigError, load
+from qicode.tool import new_default_registry
 from qicode.tui.app import QicodeApp
 from qicode.tui.view import transcript
 
@@ -28,7 +29,10 @@ def main() -> None:
 
     # 横幅交给界面在 on_mount 里挂进对话区（`MascotBanner`），而不是在这里 print——
     # 否则它会留在 Textual 接管屏幕**之前**的滚动缓冲里，两种输出混在一起。
-    app = QicodeApp(cfg.providers)
+    #
+    # 注册中心在这里建：工具是**进程级**的东西（六个工具都是无状态的），
+    # 建一次给整个会话用，不必每轮新建。
+    app = QicodeApp(cfg.providers, new_default_registry())
     app.run()
 
     _replay_transcript(app)
