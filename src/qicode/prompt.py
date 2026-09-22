@@ -52,10 +52,18 @@ SYSTEM_PROMPT = """\
 """
 
 
+#: 吉祥物和右侧文字之间留几格。太挤的话文字像是贴在脸上。
+BANNER_GAP = 4
+
+
 def render_banner(version: str, cwd: str) -> str:
     """拼出启动横幅：吉祥物 + 版本号 + 当前工作目录 + 就绪提示。
 
-    左边是吉祥物，右边一列文字。右侧文字略微下移，视觉上跟图案垂直居中。
+    左边是吉祥物，右边一列文字，右侧文字整体下移让它跟图案垂直居中。
+
+    **上下各留一行空白**（`_PAD`）。横幅是整屏的第一块，贴着终端顶边会显得
+    局促；底下那一行更必要——不留的话第一条消息紧贴着腮红那行，整个 banner
+    跟对话黏成一坨。
     """
     right_column = [
         f"[bold]Qicode[/] [dim]v{version}[/]",
@@ -68,13 +76,14 @@ def render_banner(version: str, cwd: str) -> str:
     # 右侧文字整体下移，让它大致落在图案的中段而不是顶着耳朵。
     offset = (len(rows) - len(right_column)) // 2
 
-    lines = []
+    lines = [""]  # 顶部留白
     for index, row in enumerate(rows):
         right_index = index - offset
         right = ""
         if 0 <= right_index < len(right_column):
             right = right_column[right_index]
         # 图案每行都是固定列数，宽度一致，所以直接拼、不用补空格对齐。
-        lines.append(f"{row}  {right}".rstrip())
+        lines.append(f"{row}{' ' * BANNER_GAP}{right}".rstrip())
+    lines.append("")  # 底部留白，别跟第一条消息贴在一起
 
     return "\n".join(lines)
