@@ -130,7 +130,12 @@ class QicodeApp(App):
 对外接口：`Provider`（typing.Protocol）、`Message`、`StreamEvent`、`new_provider(cfg) -> Provider`。
 子单元：
 - anthropic 适配器：封装 `anthropic.AsyncAnthropic`。把 `list[Message]` 转为 SDK 的
-  messages 入参，注入 `system=SYSTEM_PROMPT`、按 `cfg.thinking` 设 `thinking={"type":"enabled","budget_tokens":...}`；
+  messages 入参，注入 `system=SYSTEM_PROMPT`、按 `cfg.thinking` 设
+  `thinking={"type": "adaptive", "display": "summarized"}`；
+  （**不用固定预算的 `{"type": "enabled", "budget_tokens": N}`**：那种写法在当前 Claude
+  模型 Fable 5/5.1、Opus 5/4.8/4.7、Sonnet 5 上已被移除，传了直接返回 400。
+  `display` 也必须显式写——它缺省是 `omitted`，那样服务端不发思考内容，就没有增量
+  可「识别但不渲染」，F5 无从谈起。）
   使用 `async with client.messages.stream(...) as stream: async for event in stream:` 迭代，
   取 `event.type == "content_block_delta"` 中的 `text` delta → `StreamEvent(text=...)`；
   遇 thinking delta 丢弃；正常结束 yield `StreamEvent(done=True)`；

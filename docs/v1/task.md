@@ -136,7 +136,10 @@
 3. `async def stream(self, msgs) -> AsyncIterator[StreamEvent]`：
     - 把 `msgs` 转 `[{"role": m.role, "content": m.content} for m in msgs]`。
     - `params = {"model": self._model, "max_tokens": 4096, "system": SYSTEM_PROMPT, "messages": [...]}`。
-    - 若 `self._thinking`，加 `thinking={"type": "enabled", "budget_tokens": 2048}`。
+    - 若 `self._thinking`，加 `thinking={"type": "adaptive", "display": "summarized"}`。
+      **不要写固定预算的 `{"type": "enabled", "budget_tokens": N}`**——那在当前 Claude
+      模型（Fable 5/5.1、Opus 5/4.8/4.7、Sonnet 5）上已被移除，传了直接 400。
+      `display` 也必须显式写：缺省是 `omitted`，服务端就不发思考内容了。
     - `try: async with self._client.messages.stream(**params) as stream: async for event in stream:`
       根据 `event.type` 判断：`content_block_delta` 且 `event.delta.type == "text_delta"` →
       `yield StreamEvent(text=event.delta.text)`；`thinking_delta` 跳过；其他事件忽略。
