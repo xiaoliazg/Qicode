@@ -1,0 +1,83 @@
+# Qicode 配置文件示例
+# 用法：复制为 ~/.qicode/config.yaml 并改成你自己的值
+#   mkdir -p ~/.qicode && cp config.example.yaml ~/.qicode/config.yaml
+#
+# 每个 provider 五个必填字段 + 两个可选字段：
+#   name            供应商标识名（列表内不可重复）
+#   protocol        协议类型：openai_compatible | anthropic
+#   model           模型名（服务端注册/约定的模型 ID）
+#   base_url        服务地址（以 http:// 或 https:// 开头）
+#   api_key         认证密钥；支持 ${ENV_VAR} 引用环境变量，避免明文落盘
+#   thinking        可选，是否启用扩展思考，缺省 false。它的含义是「**主动请求**
+#                   服务端开启思考」，关掉**不等于**服务端一定不思考——不发该参数时
+#                   服务端用自己的默认值，而 Anthropic 官方 Opus 5 / Fable 5、
+#                   DeepSeek 等后端的默认就是开启思考
+#   thinking_params 可选，思考开关对应的请求参数（即「怎么向服务端表达思考」）。
+#                   **显式写了就一定会发出去，与 thinking 开关无关**；没写时才由
+#                   thinking 决定。四种组合：
+#                     thinking=true  + 未写 → 发适配器默认值
+#                     thinking=true  + 已写 → 发你写的那份
+#                     thinking=false + 未写 → 什么都不发（服务端按自身默认值来）
+#                     thinking=false + 已写 → 发你写的那份 ← 这才是真正关闭思考
+#
+# ⚠️ 下面四条示例里只有第一条是**启用**的：它是唯一不需要密钥、装好 Ollama
+# 就能跑通的一条。其余三条都要你自己的 key，所以以注释形式给出——直接照抄
+# 带 ${ENV_VAR} 的那几行，会因为环境变量未设置而启动失败。改用时先 export。
+
+providers:
+  # ① 本地 Ollama（OpenAI 兼容接口）—— 开箱即可用
+  - name: my-ollama
+    protocol: openai_compatible
+    model: qwen2.5vl:7b
+    base_url: http://127.0.0.1:11434/v1
+    api_key: ollama            # Ollama 不校验密钥，填任意非空值即可
+    thinking: false
+
+  # ② 同一协议下开启思考的写法
+  #    本协议的默认请求参数是 chat_template_kwargs.enable_thinking（适配器内置
+  #    默认值，就是下面注释掉的那份），不写 thinking_params 就是用它。
+  #    ⚠️ 前提是**服务端与所选模型真的支持思考输出**。本地 Ollama 的
+  #    qwen2.5vl:7b 不支持，开了这个开关不会有任何效果，界面也不会出现思考块。
+  #    反过来，想确认关闭（而不是只写 thinking: false）就在这里明确表达——例如
+  #    thinking_params: {enable_thinking: false}。
+  # - name: my-thinking-backend
+  #   protocol: openai_compatible
+  #   model: <换成支持思考输出的模型 ID>
+  #   base_url: http://127.0.0.1:8000/v1
+  #   api_key: ${MY_API_KEY}
+  #   thinking: true
+  #   thinking_params:                    # 不写则用适配器默认值（就是这份）
+  #     chat_template_kwargs:
+  #       enable_thinking: true
+
+  # ③ Anthropic 官方 Claude（Anthropic 原生协议）
+  #    ⚠️ 本项目开发机上没有官方 key，**这条链路未做真机验证**，目前只有单元测试覆盖。
+  # - name: my-claude
+  #   protocol: anthropic
+  #   model: claude-sonnet-5
+  #   base_url: https://api.anthropic.com
+  #   api_key: ${ANTHROPIC_API_KEY}
+  #   thinking: true
+  #   thinking_params:                    # 不写则用适配器默认值（就是下面两行）
+  #     type: adaptive                    # 让模型按需决定思考深度
+  #     display: summarized               # 不写则思考内容恒为空串，界面看不到思考
+  #   # 想确保关闭思考（而不是只把 thinking 设成 false）就写：
+  #   #   thinking_params:
+  #   #     type: disabled
+  #   # 注意：{type: enabled, budget_tokens: N} 这种固定预算写法在当前 Claude 模型
+  #   # （Fable 5/5.1、Opus 5/4.8/4.7、Sonnet 5）上已被移除，传了会直接返回 400；
+  #   # 只有 Haiku 4.5、Sonnet 4.5 一类旧模型才需要它。
+
+  # ④ Anthropic 兼容服务举例：DeepSeek 的 Anthropic 端点
+  #    写法依据 https://api-docs.deepseek.com/guides/anthropic_api（2026-09-18 核对）。
+  #    ✅ 已在真机上跑通（对话、思考块、跨协议切换、多轮）。
+  # - name: my-deepseek
+  #   protocol: anthropic
+  #   model: deepseek-flash
+  #   base_url: https://api.deepseek.com/anthropic
+  #   api_key: ${DEEPSEEK_API_KEY}
+  #   thinking: false
+  #   # 该端点文档标注：thinking 受支持（其中 budget_tokens 会被忽略）、
+  #   # 响应里的 thinking 内容块受支持、temperature 受支持（0.0~2.0）。
+  #   # 传 claude-* 模型名会被它自动映射：claude-opus* → deepseek-v4-pro，
+  #   # claude-sonnet* / claude-haiku* → deepseek-flash。
