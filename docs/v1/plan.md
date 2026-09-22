@@ -283,8 +283,8 @@ qicode/
 ```
 说明：
 - 依赖版本预期：`textual`、`rich`、`anthropic`、`openai`、`pyyaml`。在 `pyproject.toml` 中
-  以 `dependencies = [...]` 声明，锁文件用 `uv.lock`（推荐 `uv`）或 `pip-compile` 生成的
-  `requirements.txt`。
+  以 `dependencies = [...]` 声明。**不引入锁文件**：本项目用 `uv pip install` 安装，
+  它不读 `uv.lock`，留一份不会被读取的锁文件只会悄悄过期。
 - `tui/` 拆 4 个文件按职责切分；若实现时过碎可合并，不影响接口。
 - `.qicode/config.yaml` 含真实密钥，应在 `.gitignore` 忽略；提交一份 `config.yaml.example`。
 - `pyproject.toml` 里通过 `[project.scripts] qicode = "qicode.cli:main"` 暴露 CLI 入口；
