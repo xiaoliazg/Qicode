@@ -12,12 +12,13 @@ import asyncio
 from collections.abc import Awaitable, Callable
 
 import pytest
+from textual.containers import VerticalScroll
 from textual.pilot import Pilot
 
 from qicode.config import ProviderConfig
 from qicode.llm import StreamEvent
 from qicode.tui.app import QicodeApp, SessionState
-from qicode.tui.view import PromptArea
+from qicode.tui.view import MARKER, PromptArea, ReplyBlock
 
 Scenario = Callable[[QicodeApp, Pilot], Awaitable[None]]
 
@@ -47,6 +48,11 @@ def screen_text(app: QicodeApp) -> str:
     # `_compositor` 是内部属性：Textual 只公开了 SVG 导出，没有纯文本导出。
     strips = app.screen._compositor.render_strips()
     return "\n".join(strip.text for strip in strips)
+
+
+def screen_lines(app: QicodeApp) -> list[str]:
+    """整屏按行切开，用来断言「谁和谁落在同一行」。"""
+    return screen_text(app).split("\n")
 
 
 async def finish_turn(app: QicodeApp, pilot: Pilot) -> None:
@@ -275,6 +281,150 @@ def test_streaming_area_shows_timer_before_first_token(make_config, make_provide
         assert app.state is SessionState.STREAMING
 
         await finish_turn(app, pilot)
+
+    with_app([make_config()], scenario)
+
+
+def test_conversation_starts_at_the_top_not_glued_to_the_bottom(make_config) -> None:
+    """内容不满一屏时，对话从**顶部**开始排，不贴底。
+
+    Textual 的锚定是无条件贴底的：合成器每帧算 `内容底部 - 容器高` 直接写进
+    `scroll_y`（绕过 clamp），内容比视口矮时这个值是负数，整块内容被推到屏幕
+    下半截。后果一是启动时 banner 悬在半空、上面一片空白，二是最后一块长高
+    一行就把上面全都顶上去一行。所以锚定要等内容真的溢出视口再挂。
+    """
+
+    async def scenario(app: QicodeApp, pilot: Pilot) -> None:
+        log = app.query_one("#log", VerticalScroll)
+        assert log.scroll_y == 0
+        assert log.max_scroll_y == 0  # 确认前提：内容确实没超出视口
+        # banner 是对话区的第一块，它必须贴着顶。
+        assert log.children[0].region.y == 0
+
+    with_app([make_config()], scenario)
+
+
+def test_long_conversation_follows_the_bottom(make_config, make_provider) -> None:
+    """内容超出视口之后要跟着走——最新的那块必须留在屏幕上。
+
+    这是 `_follow_tail` 的另一半。不贴底（内容不满一屏时）和不跟随（内容溢出
+    之后）是两件事，改的时候很容易只顾一头：把锚定整个去掉，长对话就会停在
+    顶上、新内容全在屏幕外面。
+
+    这里特意让整段回复**一口气**灌进来（假 provider 没有间隔），因为
+    `mount()` / `update()` 只是把重绘排进队列，内容刚变的那一刻 `max_scroll_y`
+    还是旧值——一次性到达的一大段是最容易漏掉的情形。
+    """
+
+    async def scenario(app: QicodeApp, pilot: Pilot) -> None:
+        reply = "\n\n".join(f"第 {i} 段" for i in range(40))
+        app.provider = make_provider([StreamEvent(text=reply), StreamEvent(done=True)])
+        app.submit("来一大段")
+        await finish_turn(app, pilot)
+
+        log = app.query_one("#log", VerticalScroll)
+        assert log.max_scroll_y > 0, "前提不成立：这段内容没把视口撑满"
+        assert log.is_anchored, "内容已经溢出了，却还没开始跟随"
+        assert log.scroll_y == log.max_scroll_y, "没停在底部"
+        assert "第 39 段" in screen_text(app), "最新的一段不在屏幕上"
+
+    with_app([make_config()], scenario)
+
+
+def test_scrolling_up_stops_the_following(make_config, make_provider) -> None:
+    """用户自己往上滚之后，就不再被硬拽到底。
+
+    这条是用 Textual 的锚定、而不是每次来个新块就手动 `scroll_end()` 的理由：
+    手动拽会一直跟用户抢滚动条，他根本翻不上去。锚定由 `_anchor_released`
+    让位（`Widget.anchor()` 的原话是 "until the user moves the scroll position"），
+    滚回底部又自动恢复。
+    """
+
+    async def scenario(app: QicodeApp, pilot: Pilot) -> None:
+        reply = "\n\n".join(f"第 {i} 段" for i in range(40))
+
+        async def ask(text: str) -> None:
+            app.provider = make_provider(
+                [StreamEvent(text=reply), StreamEvent(done=True)]
+            )
+            app.submit(text)
+            await finish_turn(app, pilot)
+
+        await ask("来一大段")
+
+        log = app.query_one("#log", VerticalScroll)
+        log.scroll_up(animate=False)
+        await pilot.pause()
+        resting = log.scroll_y
+        assert resting < log.max_scroll_y, "前提不成立：没能滚上去"
+
+        # 再来一轮，内容会继续变长；刚才停的位置不该被拽走。
+        await ask("再来一段")
+
+        assert log.scroll_y == resting
+
+    with_app([make_config()], scenario)
+
+
+def test_reply_text_starts_on_the_same_line_as_the_marker(
+    make_config, make_provider
+) -> None:
+    """`●` 必须跟正文的第一行同行（这是这次改版要修的观感问题之一）。
+
+    用的是一整段**不含空格的纯中文**，这是最容易露馅的输入：Rich 的折行
+    （`rich/_wrap.py` 的 `divide_line`）按空白分词，整段中文就是一个「词」，
+    词比整行宽时会「先换行再硬折」——如果 `● ` 是拼进 markdown 源码里的，
+    它就会被晾在单独一行、正文从第二行顶格开始。分成两列才不会这样。
+    """
+    reply = "杭州是一座拥有千年的历史古城，位于中国浙江省北部，自古以来就是繁华之地。"
+
+    async def scenario(app: QicodeApp, pilot: Pilot) -> None:
+        app.provider = make_provider([StreamEvent(text=reply), StreamEvent(done=True)])
+        app.submit("介绍一下杭州")
+        await finish_turn(app, pilot)
+
+        head = reply[:8]
+        paired = [ln for ln in screen_lines(app) if MARKER in ln and head in ln]
+        assert paired, "圆点没跟正文同行：\n" + screen_text(app)
+
+    with_app([make_config()], scenario)
+
+
+def test_reply_block_stays_put_when_it_settles(make_config, make_provider) -> None:
+    """流式那一块定型时**不许挪窝**——这是这次改版修的主要问题。
+
+    改之前：对话区是 `RichLog`，流式文字画在它下面另一个独立的 `#streaming`
+    Static 上；定型后整段写进 RichLog（历史不满一屏时它从头顶开始排），于是
+    屏幕上看起来就是「生成时贴着输入框、一结束就弹上去」。
+
+    改之后：回复块本身就是对话区的**最后一个子节点**，流式和定型刷的是同一个
+    控件。所以这里断言的是 y 坐标**逐像素相等**，而不只是「文字还在」。
+    """
+
+    async def scenario(app: QicodeApp, pilot: Pilot) -> None:
+        app.provider = make_provider(
+            [
+                StreamEvent(text="第一行\n"),
+                StreamEvent(text="第二行\n"),
+                StreamEvent(done=True),
+            ],
+            delay=0.3,
+        )
+        app.submit("问")
+        # 故意不等流结束：要的就是「还在流式」的那一瞬间的位置。
+        await pilot.pause(0.1)
+
+        block = app._streaming
+        assert isinstance(block, ReplyBlock)
+        y_streaming = block.region.y
+        # 挡住退化情形：布局没跑过时 region 是 (0,0,0,0)，那样两边都相等、
+        # 用例会「假绿」。
+        assert y_streaming > 0
+
+        await finish_turn(app, pilot)
+
+        assert block.region.y == y_streaming
+        assert "第二行" in screen_text(app)  # 定型内容确实画上去了
 
     with_app([make_config()], scenario)
 
