@@ -25,6 +25,7 @@ from textual.message import Message as TextualMessage
 from textual.widgets import Static, TextArea
 
 from qicode.llm import Message, Provider
+from qicode.prompt import FRAME_INTERVAL, bounce_offset, render_banner
 
 # 消息行首的圆点，用户输入、助手回复、错误三处共用，只靠颜色和排版区分。
 MARKER = "●"
@@ -101,6 +102,59 @@ class PromptArea(TextArea):
 
         # 其余按键（含普通字符、退格、方向键）原样交给基类。
         await super()._on_key(event)
+
+
+class MascotBanner(Static):
+    """启动横幅。左边的吉祥物每隔几秒轻轻蹦一下。
+
+    **为什么做成控件而不是拼好的字符串。** 换帧就得有东西记住「现在是第几帧」
+    并且定时重绘；`Static` 加一个计时器正好，不必再写一个更重的 `Widget` 子类。
+
+    有一条线**不能碰**：横幅的高度任何时刻都得一样。它是对话区的第一个子节点，
+    高一行矮一行，下面所有内容都会跟着回流——那正是 `app._follow_tail` 刚修掉的
+    「跳版」。所以蹦跳整个做在 `render_banner` 内部（图案在固定高度的框里往上挪
+    一格再落回来，框本身不动，返回的行数因而恒定），这一层只负责把新的一帧交出去。
+
+    滚出视野就不刷了：横幅聊两轮就滚上去，看不见的东西没有重绘的理由。
+    """
+
+    def __init__(self, version: str, cwd: str) -> None:
+        super().__init__(render_banner(version, cwd), expand=True)
+        self._version = version
+        self._cwd = cwd
+        #: 当前帧号，也是 `bounce_offset` 的输入。
+        self._frame = 0
+        #: 此刻画着的抬起高度。**用来跳过无变化的重绘**——一个周期 40 帧里只有
+        #: 4 帧图案不一样，剩下 36 帧再 `update()` 一次纯属白刷（`Static.update`
+        #: 会带 `layout=True` 标脏布局）。
+        self._offset = 0
+
+    def on_mount(self) -> None:
+        self.set_interval(FRAME_INTERVAL, self._tick)
+
+    def _tick(self) -> None:
+        if not self._in_view():
+            return
+        self._frame += 1
+        offset = bounce_offset(self._frame)
+        if offset == self._offset:
+            return
+        self._offset = offset
+        self.update(render_banner(self._version, self._cwd, offset))
+
+    def _in_view(self) -> bool:
+        """横幅还有没有一部分露在容器视口里。
+
+        `region` 和 `container_viewport` 都是**屏幕坐标**（Textual 8.2.8 实测：
+        容器往下挪 4 行，横幅的 `region.y` 就从 0 变成 4；容器再滚动 30 行，
+        它从 4 变成 -26）。同一条坐标系里直接比就行，不用自己去减 `scroll_y`。
+
+        还没上屏时两个都是空区域（`bottom == 0`），这里判成「看不见」而跳过——
+        正是想要的结果。
+        """
+        region = self.region
+        view = self.container_viewport
+        return region.bottom > view.y and region.y < view.bottom
 
 
 def user_block(text: str) -> Text:

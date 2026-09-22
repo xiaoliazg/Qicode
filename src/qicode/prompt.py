@@ -3,6 +3,8 @@
 这一层没有任何依赖，也不碰网络和界面：只产出两段文本，谁需要谁来取。
 """
 
+from rich.markup import escape
+
 MASCOT_ART = """\
 .HH......HH.
 .HHHHHHHHHH.
@@ -43,6 +45,7 @@ def _render_pixel_art(art: str, colors: dict[str, str]) -> str:
 # 吉祥物图案，已是可直接嵌入 Rich 输出的 markup。
 MASCOT_BANNER: str = _render_pixel_art(MASCOT_ART, MASCOT_COLORS)
 
+
 def system_prompt(provider_name: str, model: str) -> str:
     """按当前接入点拼出 system prompt。
 
@@ -75,35 +78,87 @@ def system_prompt(provider_name: str, model: str) -> str:
 #: 吉祥物和右侧文字之间留几格。太挤的话文字像是贴在脸上。
 BANNER_GAP = 4
 
+#: 图案上方留出的**起跳空间**（行）。蹦起来时图案要往上占一行，没有这块
+#: 空间就会被裁掉，所以横幅的高度按 `图案行数 + BOUNCE_HEADROOM` 算。
+BOUNCE_HEADROOM = 1
 
-def render_banner(version: str, cwd: str) -> str:
+#: 蹦一下的逐帧高度：每一帧图案抬起几行（0 = 坐在框底）。前两帧抬着，
+#: 后两帧落回——合起来约 0.4 秒，就是「轻轻一下」。
+BOUNCE_FRAMES = (1, 1, 0, 0)
+
+#: 一个完整周期多少帧（含蹦完之后静置的部分）。40 帧 × 0.1 秒 = 每 4 秒蹦一下。
+BOUNCE_PERIOD_FRAMES = 40
+
+#: 动画帧间隔（秒）。
+FRAME_INTERVAL = 0.1
+
+
+def bounce_offset(frame: int) -> int:
+    """第 `frame` 帧时，图案该抬起几行。
+
+    绝大多数帧返回 0——蹦是**偶发**的，一个周期里只有头几帧抬起来。这样比
+    一直来回晃更像「活着」，也不会一直在那儿抢注意力。
+    """
+    phase = frame % BOUNCE_PERIOD_FRAMES
+    if phase < len(BOUNCE_FRAMES):
+        return BOUNCE_FRAMES[phase]
+    return 0
+
+
+def render_banner(version: str, cwd: str, art_offset: int = 0) -> str:
     """拼出启动横幅：吉祥物 + 版本号 + 当前工作目录 + 就绪提示。
 
-    左边是吉祥物，右边一列文字，右侧文字整体下移让它跟图案垂直居中。
+    左边是吉祥物，右边一列文字，右侧文字跟图案垂直居中。
 
-    **上下各留一行空白**（`_PAD`）。横幅是整屏的第一块，贴着终端顶边会显得
-    局促；底下那一行更必要——不留的话第一条消息紧贴着腮红那行，整个 banner
-    跟对话黏成一坨。
+    `art_offset` 是**图案抬起几行**（0 = 静止）。它是这个函数唯一的动态输入，
+    由 `bounce_offset` 按帧给出。
+
+    有一条约束必须守住：**任何 `art_offset` 下，这个函数返回的行数都一样**。
+    横幅在对话区里，高度一变整块内容就会回流、下面的东西跟着跳——那正是
+    `app._follow_tail` 刚修掉的那个毛病。所以图案外面套了一个固定高度的**框**
+    （`图案行数 + BOUNCE_HEADROOM`），图案在框里挪，框本身不动。
+
+    同样为了这个，右侧文字的落点按**框**高居中、跟 `art_offset` 无关：
+    图案蹦的时候，文字必须纹丝不动。
+
+    底部留一行空白（见文件末尾），别跟第一条消息贴在一起。
     """
     right_column = [
         f"[bold]Qicode[/] [dim]v{version}[/]",
-        f"[dim]{cwd}[/]",
+        # 目录名是**用户那边的字符串**，里面完全可能有 `[`。这个返回值会当成
+        # Rich 标记解析（`Static(markup=True)`），不转义的话三种坏法都实测过：
+        # `/tmp/a[b]c` 渲染成 `/tmp/ac`（不认得的标签直接丢，路径被悄悄吃掉一截）；
+        # `/tmp/[bold]x` 让后面的字全变粗体（样式被目录名劫持）；`/tmp/x[/]` 直接
+        # 抛 `MarkupError`，**启动当场崩掉**。转义只影响那一个字符，正常路径看不出来。
+        f"[dim]{escape(cwd)}[/]",
         "",
         "[dim]输入消息开始对话，Alt+Enter 或 Ctrl+J 换行，/exit 退出[/]",
     ]
 
-    rows = MASCOT_BANNER.splitlines()
-    # 右侧文字整体下移，让它大致落在图案的中段而不是顶着耳朵。
-    offset = (len(rows) - len(right_column)) // 2
+    art_rows = MASCOT_BANNER.splitlines()
+    # 图案的**显示宽度**要从原始字符画上量。`MASCOT_BANNER` 是 markup，一个格子是
+    # 一串 `[on #xxxxxx] [/]`，它的字符串长度跟屏幕上的列数根本不是一回事——
+    # 拿它去补空格，占位行会把右侧文字推出屏幕。
+    art_width = len(MASCOT_ART.splitlines()[0])
+    box_height = len(art_rows) + BOUNCE_HEADROOM
 
-    lines = [""]  # 顶部留白
-    for index, row in enumerate(rows):
-        right_index = index - offset
-        right = ""
-        if 0 <= right_index < len(right_column):
-            right = right_column[right_index]
-        # 图案每行都是固定列数，宽度一致，所以直接拼、不用补空格对齐。
-        lines.append(f"{row}{' ' * BANNER_GAP}{right}".rstrip())
+    # 文字按**框**高居中，不按图案高——图案蹦的时候文字不能跟着动。
+    text_offset = (box_height - len(right_column)) // 2
+    # 图案坐在框底，`art_offset` 是往上抬几行。
+    art_top = box_height - len(art_rows) - art_offset
+
+    lines = []
+    for index in range(box_height):
+        art_index = index - art_top
+        # 图案够不着的那几行要用**等宽的空格**占位，否则右侧文字会左移。
+        art = art_rows[art_index] if 0 <= art_index < len(art_rows) else " " * art_width
+
+        right_index = index - text_offset
+        right = (
+            right_column[right_index] if 0 <= right_index < len(right_column) else ""
+        )
+
+        lines.append(f"{art}{' ' * BANNER_GAP}{right}".rstrip())
     lines.append("")  # 底部留白，别跟第一条消息贴在一起
 
     return "\n".join(lines)

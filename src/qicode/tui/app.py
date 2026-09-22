@@ -16,17 +16,18 @@ from textual.binding import Binding, BindingType
 from textual.containers import Horizontal, VerticalScroll
 from textual.reactive import reactive
 from textual.timer import Timer
+from textual.widget import Widget
 from textual.widgets import OptionList, Static
 
 from qicode import __version__
 from qicode.config import ProviderConfig
 from qicode.conversation import Conversation
 from qicode.llm import Provider, new_provider
-from qicode.prompt import render_banner
 from qicode.redact import redact
 from qicode.tui.select import build_options, pick
 from qicode.tui.stream import TICK_INTERVAL, consume
 from qicode.tui.view import (
+    MascotBanner,
     PromptArea,
     ReplyBlock,
     status_bar,
@@ -166,7 +167,9 @@ class QicodeApp(App[None]):
         yield Static("", id="statusbar")
 
     def on_mount(self) -> None:
-        self._append(render_banner(__version__, os.getcwd()))
+        # 启动横幅。它不走 `_append`——那一条是给「一次性定型的内容」用的，
+        # 而横幅是个会自己换帧的控件（见 `MascotBanner`）。
+        self._mount_in_log(MascotBanner(__version__, os.getcwd()))
 
         if len(self.providers) == 1:
             # 单条配置直进对话（F2、AC1）。
@@ -222,7 +225,11 @@ class QicodeApp(App[None]):
         # `expand=True` 是必须的，不是随手加的：不展开的话 Static 会按内容的
         # **自然宽度**渲染，一段长中文就不会在容器宽度上折行，而是直挺挺地伸出屏幕。
         # （助手回复不走这里，它是个 `ReplyBlock`，那份 expand 在 `view.py` 里。）
-        self.query_one("#log", VerticalScroll).mount(Static(block, expand=True))
+        self._mount_in_log(Static(block, expand=True))
+
+    def _mount_in_log(self, widget: Widget) -> None:
+        """把控件挂到对话区末尾，并决定要不要开始跟随。"""
+        self.query_one("#log", VerticalScroll).mount(widget)
         self._follow_tail()
 
     def _follow_tail(self) -> None:

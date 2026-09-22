@@ -17,8 +17,9 @@ from textual.pilot import Pilot
 
 from qicode.config import ProviderConfig
 from qicode.llm import StreamEvent
+from qicode.prompt import BOUNCE_PERIOD_FRAMES
 from qicode.tui.app import QicodeApp, SessionState
-from qicode.tui.view import MARKER, PromptArea, ReplyBlock
+from qicode.tui.view import MARKER, MascotBanner, PromptArea, ReplyBlock
 
 Scenario = Callable[[QicodeApp, Pilot], Awaitable[None]]
 
@@ -149,6 +150,86 @@ def test_banner_and_statusbar_are_on_screen(make_config) -> None:
         assert "claude-sonnet-5" in screen  # 状态栏右侧 = 模型名
 
     with_app([make_config(name="anthropic", model="claude-sonnet-5")], scenario)
+
+
+def test_banner_bounces_without_shifting_anything_else(make_config) -> None:
+    """吉祥物蹦的时候，横幅的高度和右边的文字**一格都不许动**。
+
+    纯函数那一层（`tests/test_prompt.py`）已经穷尽验过 `render_banner` 的返回值，
+    这里验的是另一半：**真的挂到界面上之后**，「换一帧」这个动作不会顺带把布局
+    搅动。横幅是对话区的第一个子节点，它高一行矮一行，下面所有内容都会跟着回流
+    ——那正是 `app._follow_tail` 刚修掉的「跳版」，每 4 秒来一次会更显眼。
+    """
+
+    async def scenario(app: QicodeApp, pilot: Pilot) -> None:
+        banner = app.query_one(MascotBanner)
+        height = banner.region.height
+        assert height > 0, "前提不成立：横幅还没布局出来"
+
+        def text_rows() -> list[int]:
+            """右侧那两行文字在**屏幕上**的行号。"""
+            return [
+                i
+                for i, line in enumerate(screen_lines(app))
+                if "Qicode v" in line or "/exit" in line
+            ]
+
+        resting_rows = text_rows()
+        assert resting_rows, "前提不成立：没找到横幅右侧的文字"
+
+        # `Static.content` 是公开属性，`update()` 之后读到的就是当前那一帧。
+        frames = {banner.content}
+        for _ in range(BOUNCE_PERIOD_FRAMES):
+            banner._tick()  # 手动推进一帧，不去等真实的定时器
+            await pilot.pause()
+            assert banner.region.height == height, "蹦的时候横幅变高了"
+            assert text_rows() == resting_rows, "蹦的时候右侧文字挪位了"
+            frames.add(banner.content)
+
+        # 一个周期里要有好几种画面，否则上面那些「没变」全是因为它根本没动。
+        assert len(frames) > 1, "整个周期里画面一次都没变"
+
+    with_app([make_config()], scenario)
+
+
+def test_banner_stops_bouncing_once_it_scrolls_out_of_view(
+    make_config, make_provider
+) -> None:
+    """横幅滚出屏幕之后就不再换帧了。
+
+    它是对话区的第一块，聊两轮就被顶上去；看不见的东西没有 10Hz 重绘的理由。
+    （`Static.update()` 带 `layout=True`，每一下都是**标脏布局**，不是白刷。）
+    """
+
+    async def scenario(app: QicodeApp, pilot: Pilot) -> None:
+        log = app.query_one("#log", VerticalScroll)
+        banner = app.query_one(MascotBanner)
+
+        # 先确认它在视野里——不然下面那条断言可能只是「一直看不见」而已。
+        assert banner._in_view() is True
+
+        app.provider = make_provider(
+            [
+                StreamEvent(text="\n\n".join(f"第 {i} 段" for i in range(40))),
+                StreamEvent(done=True),
+            ]
+        )
+        app.submit("来一大段")
+        await finish_turn(app, pilot)
+
+        assert log.scroll_y == log.max_scroll_y > 0, "前提不成立：没滚到底"
+        assert banner._in_view() is False, "横幅已经被顶出屏幕了，却还认为看得见"
+
+        frozen_frame = banner._frame
+        frozen = banner.content
+        for _ in range(BOUNCE_PERIOD_FRAMES):
+            banner._tick()
+            # 逐帧查，而不是攒够一圈再比：一圈 40 帧的末尾正好落回静止帧，
+            # 攒着比的话「压根没停」也会因为最后那一帧长得一样而蒙混过关。
+            assert banner._frame == frozen_frame, "滚出视野了帧号还在涨"
+            assert banner.content == frozen, "滚出视野了还在换帧"
+
+    with_app([make_config()], scenario)
 
 
 # ────────────────────────── 输入与提交（F9）──────────────────────────
