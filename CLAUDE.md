@@ -16,11 +16,11 @@
 
 ## 文档
 
-按阶段归档，每个阶段一套四份（spec → plan → task → checklist），放在 `docs/<阶段名>/`：
+按阶段归档，每个阶段一套四份（spec → plan → task → checklist），放在 `docs/<版本号>/`：
 
-- 阶段名取「版本号 + 主题」，如 `docs/v2-chat-client/`
+- 目录名就是版本号：`docs/v1/`、`docs/v2/`……，主题写在 `docs/README.md` 的阶段表里
 - **根目录不放文档**，一律进 `docs/`
-- 代码注释引用设计文档要写全路径（如 `docs/v2-chat-client/plan.md`）——阶段名在前，裸文件名会有歧义
+- 代码注释引用设计文档要写全路径（如 `docs/v1/plan.md`）——裸文件名会有歧义
 
 索引与各阶段状态见 `docs/README.md`。
 

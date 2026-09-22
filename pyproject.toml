@@ -1,5 +1,5 @@
 # 项目元信息与打包配置。
-# 依赖与工具链见 docs/v2-chat-client/plan.md「技术栈」与「技术决策」。
+# 依赖与工具链见 docs/v1/plan.md「技术栈」与「技术决策」。
 [project]
 name = "qicode"
 version = "0.1.0"
@@ -24,3 +24,8 @@ packages = ["src/qicode"]
 
 [dependency-groups]
 dev = ["pytest>=8", "ruff>=0.6", "mypy>=1.10"]
+
+[tool.ruff]
+# 文档不参与 lint / format：`docs/` 里的 Python 代码块是说明性的，字段旁那些注释
+# 列是手工对齐的，ruff 0.16 起会把它们一起重排、把那点对齐拆掉。
+extend-exclude = ["docs"]

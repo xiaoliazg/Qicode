@@ -127,7 +127,7 @@ cli（启动编排）→ tui（交互/渲染/打断）→ session（对话状态
 - **tui** 只管用户可见的东西，不碰 HTTP。
 - **config** 只产出纯数据（`ProviderConfig`），不含任何通信行为。
 
-设计文档按**阶段**归档在 [`docs/`](docs/README.md)：v1 已归档，当前阶段是 [v2-chat-client](docs/v2-chat-client/)（[需求](docs/v2-chat-client/spec.md) / [设计](docs/v2-chat-client/plan.md) / [任务](docs/v2-chat-client/task.md) / [验收](docs/v2-chat-client/checklist.md)）。
+设计文档按**阶段**归档在 [`docs/`](docs/README.md)，当前阶段 [v1](docs/v1/)（[需求](docs/v1/spec.md) / [设计](docs/v1/plan.md) / [任务](docs/v1/task.md) / [验收](docs/v1/checklist.md)）。
 
 ## 开发
 

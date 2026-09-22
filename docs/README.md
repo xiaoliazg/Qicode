@@ -15,30 +15,25 @@ spec.md（做什么）→ plan.md（怎么做）→ task.md（按什么顺序做
 
 ## 存放约定
 
-- 每个阶段一个目录：`docs/<阶段名>/`，内含上述四份文档。
-- 阶段名取「版本号 + 主题」，如 `v2-chat-client`。
-- **根目录不放文档**——所有文档一律进 `docs/`，由本文件索引。
+- 每个阶段一个目录：`docs/<版本号>/`，内含上述四份文档。
+- **根目录不放文档**，一律进 `docs/`，由本文件索引。
+- 一个阶段的四份文档全部通过审批后才动代码；`checklist.md` 在编码前就要定稿。
 
 ## 阶段
 
 | 阶段 | 主题 | 技术栈 | 状态 | 文档 |
 |------|------|--------|------|------|
-| v1 | 对话基座 | prompt_toolkit + 同步 + threading | 已归档 | [v1/](v1/) |
-| **v2-chat-client** | 多协议 LLM 终端对话客户端 | **Textual + async-first** | **待实施** | [v2-chat-client/](v2-chat-client/) |
+| **v1** | 多协议 LLM 终端对话客户端 | Textual + async-first | **待实施** | [v1/](v1/) |
 
-### 关于 v1（已归档）
+### v1 要做什么
 
-`v1/` 是第一版对话基座的文档，代码即仓库里 `qicode/` 现有实现的主体。
+给 Qicode 打第一块基石：在工具调用、权限、记忆等高级能力之前，先打通「人 ↔ LLM」的最小闭环——
+终端里流畅的多轮对话。要点：
 
-它的技术栈是 prompt_toolkit + 同步 + threading，与 v2 定的 Textual + async-first 是两套
-东西。v1 里记录的东西仍然有效，值得在实施 v2 前翻一翻：
+- **一套配置接两种协议**：Anthropic 原生与 OpenAI 兼容（含自定义 `base_url`），上层交互完全一致。
+- **Textual 全功能 TUI**：启动横幅、对话区、带边框的输入框、底部状态栏；宽窄自适应。
+- **流式呈现**：逐字实时输出，结束后整段按 markdown 美化定型。
+- **不阻塞**：等待与流式期间界面保持响应（async-first，不是靠线程）。
+- **多 provider**：单条直进，多条启动时用方向键列表选。
 
-- **实测证据的做法**——每个验收条目都附「怎么验的、看到了什么」（如 20 秒内 283 次内容
-  变化、DeepSeek 同题 187 个 vs 0 个思考字符的受控对比、抓转义序列核对灰斜体）。
-- **踩过的坑**——尤其：Anthropic 侧 `thinking` 用固定预算写法 `{type: enabled,
-  budget_tokens: N}` 在当前 Claude 模型上会直接 400；`display` 缺省为 `omitted`，不显式
-  写 `summarized` 就看不到思考文字。v2 的 `plan.md` 里写的是 `budget_tokens` 那种形状，
-  接官方 Claude 时需要按这里的记录调整。
-- **终端行为上的坑**——`shutil.get_terminal_size()` 在 TUI 接管 stdin 后会退回 (80, 24)
-  兜底值；底栏与输入行在 prompt_toolkit 里凑不到一起。这些在 Textual 下多半不复现，但先
-  知道有这类问题不是坏事。
+详见 [v1/spec.md](v1/spec.md)。任务的执行顺序见 [v1/task.md](v1/task.md)。
