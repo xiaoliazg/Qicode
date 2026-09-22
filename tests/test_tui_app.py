@@ -430,3 +430,60 @@ def test_api_key_never_appears_on_screen(make_config, make_provider) -> None:
         assert secret not in screen_text(app)
 
     with_app([make_config(api_key=secret)], scenario)
+
+
+def test_api_key_inside_an_error_message_is_masked(make_config, make_provider) -> None:
+    """N5：上游把密钥抄进了错误原文时，抹掉它再显示。
+
+    `str(exc)` 是别人写的字符串，抄没抄凭据不由我们说了算；而这句原文会直接
+    画在用户屏幕上（`tests/test_redact.py` 里另有一套针对这一层函数的边界用例）。
+    """
+    secret = "sk-DEADBEEF-should-never-be-rendered"
+
+    async def scenario(app: QicodeApp, pilot: Pilot) -> None:
+        app.provider = make_provider(
+            [
+                StreamEvent(
+                    err=RuntimeError(f"401 invalid api key: {secret} (check config)")
+                )
+            ]
+        )
+        app.submit("问")
+        await finish_turn(app, pilot)
+
+        screen = screen_text(app)
+        assert secret not in screen
+        # 抹掉的是密钥，不是整条错误——排障信息必须留着。
+        assert "401 invalid api key" in screen
+        assert "check config" in screen
+        assert "***" in screen
+
+    with_app([make_config(api_key=secret)], scenario)
+
+
+def test_other_providers_keys_are_masked_too(make_config, make_provider) -> None:
+    """抹的是**配置里所有** provider 的密钥，不止当前在用的那个。
+
+    出错的时候用户多半正要切到另一家去试，那时候弹出来的错误里同样不该带出
+    别家的密钥——哪怕这次请求根本没用它。
+    """
+    active = "sk-ACTIVE-key-aaaaaaaaaaaa"
+    other = "sk-OTHER-key-bbbbbbbbbbbb"
+
+    async def scenario(app: QicodeApp, pilot: Pilot) -> None:
+        # 两份配置会先进选择界面；这条用例不关心选择，直接摆成对话态。
+        app.state = SessionState.IDLE
+        app.provider = make_provider(
+            [StreamEvent(err=RuntimeError(f"boom: {active} / {other}"))]
+        )
+        app.submit("问")
+        await finish_turn(app, pilot)
+
+        screen = screen_text(app)
+        assert active not in screen
+        assert other not in screen
+
+    with_app(
+        [make_config(name="a", api_key=active), make_config(name="b", api_key=other)],
+        scenario,
+    )

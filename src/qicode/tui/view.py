@@ -109,9 +109,14 @@ def user_block(text: str) -> Text:
     return Text.assemble((f"{MARKER} ", MARKER_STYLE), (text, ""))
 
 
-def error_block(err: Exception) -> Text:
-    """错误块（F11）。红色，与正常内容一眼可分，且**不退出**。"""
-    return Text(f"{MARKER} {err}", style=ERROR_STYLE)
+def error_block(message: str) -> Text:
+    """错误块（F11）。红色，与正常内容一眼可分，且**不退出**。
+
+    收的是**已经拼好的字符串**，不是异常对象：上游异常的原文可能夹带密钥，
+    必须先过一遍 `qicode.redact` 再送到这里（那一层在 `app.py` 里做，
+    因为只有它同时握着异常和 provider 配置）。这一层只管画。
+    """
+    return Text(f"{MARKER} {message}", style=ERROR_STYLE)
 
 
 def assistant_block(reply: str, elapsed: float) -> RenderableType:

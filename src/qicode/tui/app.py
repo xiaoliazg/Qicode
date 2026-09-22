@@ -22,6 +22,7 @@ from qicode.config import ProviderConfig
 from qicode.conversation import Conversation
 from qicode.llm import Provider, new_provider
 from qicode.prompt import render_banner
+from qicode.redact import redact
 from qicode.tui.select import build_options, pick
 from qicode.tui.stream import TICK_INTERVAL, consume
 from qicode.tui.view import (
@@ -299,14 +300,30 @@ class QicodeApp(App[None]):
             # 空回复**不进历史**。Anthropic 对 content 为空的消息直接返回 400，
             # 把它存进去会让**下一轮**莫名其妙地失败，而用户完全看不出这跟上一轮有关。
             # 与其埋一颗这种雷，不如当场把这一轮标成失败。
-            log.write(error_block(RuntimeError("模型返回了空回复")))
+            log.write(error_block("模型返回了空回复"))
 
         self._end_turn()
 
     def _finish_with_error(self, err: Exception) -> None:
         """本轮失败：对话区标红，**不退出**（F11、AC11）。"""
-        self.query_one("#log", RichLog).write(error_block(err))
+        self.query_one("#log", RichLog).write(error_block(self._safe_message(err)))
         self._end_turn()
+
+    def _safe_message(self, err: Exception) -> str:
+        """把异常原文里可能夹带的密钥抹掉，再交给界面（N5）。
+
+        **必须在这里做，不能更晚**：这句文字会被画进对话区，是用户肉眼可见的
+        一屏内容——截屏、录屏、共享终端都带得走。上游异常里夹带的凭据不该
+        出现在那儿，这一点本身就够了。
+
+        （顺带记一笔边界：失败的那一轮**不会**被 `cli._replay_transcript` 回放，
+        因为回放的是 `conv` 里的消息，而错误的轮次压根不入历史。所以这道防线
+        守的是屏幕，不是终端的回滚缓冲。哪天让错误也进历史或回放，这里已经挡住了。）
+
+        抹的是**当前配置里所有 provider 的 api_key**，不止当前这个：出错时用户
+        多半正要切到另一家去试，那时候的错误信息同样不该带出别家的密钥。
+        """
+        return redact(str(err), [cfg.api_key for cfg in self.providers])
 
     def _end_turn(self) -> None:
         """收尾：停表、清动态区、回空闲。"""
