@@ -62,7 +62,7 @@ def render_banner(version: str, cwd: str) -> str:
         f"[bold]Qicode[/] [dim]v{version}[/]",
         f"[dim]{cwd}[/]",
         "",
-        "[dim]输入消息开始对话，/exit 退出[/]",
+        "[dim]输入消息开始对话，Alt+Enter 或 Ctrl+J 换行，/exit 退出[/]",
     ]
 
     rows = MASCOT_BANNER.splitlines()

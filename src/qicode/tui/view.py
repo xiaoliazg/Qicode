@@ -15,10 +15,13 @@ from rich.markdown import Markdown
 from rich.table import Table
 from rich.text import Text
 from textual import events
-from textual.message import Message
+
+# Textual 的消息基类跟对话消息重名。这个文件通篇讲的是「对话消息怎么画」，
+# 所以 `Message` 留给 `qicode.llm` 那个，Textual 的这个起个明确的别名。
+from textual.message import Message as TextualMessage
 from textual.widgets import TextArea
 
-from qicode.llm import Provider
+from qicode.llm import Message, Provider
 
 # 消息行首的圆点，用户输入、助手回复、错误三处共用，只靠颜色和排版区分。
 MARKER = "●"
@@ -33,6 +36,9 @@ DIM = "dim"
 # 每 0.1 秒换一帧就会把整行顶得左右乱跳。
 SPINNER_FRAMES = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
 
+#: 在输入框里按下就换行（而不是提交）的键名。理由见 `PromptArea` 的类文档。
+NEWLINE_KEYS = frozenset({"alt+enter", "shift+enter", "ctrl+j"})
+
 
 class PromptArea(TextArea):
     """带提交语义的输入框。
@@ -46,14 +52,28 @@ class PromptArea(TextArea):
 
     所以提交语义只能在这一层自己接：
 
-    - `Enter`     → 发 `Submitted` 消息，**不**插换行
-    - `Alt+Enter` → 插换行（F9 要求的多行编辑）
+    - `Enter` → 发 `Submitted` 消息，**不**插换行
+    - `Alt+Enter` / `Shift+Enter` / `Ctrl+J` → 插换行（F9 要求的多行编辑）
 
     实测（Textual 8.2.8）：`enter` / `alt+enter` / `shift+enter` 是三个互不相同的
     键名，且只有 `enter` 会被基类插成换行。这给了我们一个干净的接管点。
+
+    **换行为什么要给三个键**：单个都不够可靠，各自覆盖一类终端。
+
+    - `Alt+Enter` 是 spec（AC9）写的那个。但绝大多数终端给它发的是 `ESC CR`，
+      而 Textual 的解析器在 `_xterm_parser.py` 里只在键名长度为 1 时才补 `alt+`
+      前缀（`if len(name) == 1 and alt`），`\\r` 的键名是五字符的 `enter`，
+      于是 **alt 被丢掉、退化成普通 Enter**——按下去直接就把消息发出去了。
+      只有实现了 kitty 键盘协议 / xterm modifyOtherKeys 的终端（Kitty、WezTerm、
+      Ghostty、开了对应选项的 iTerm2……）才会把它发成 `CSI 13;3u`，Textual 认作
+      `alt+enter`。
+    - `Ctrl+J` 是 `LF`（0x0A）。终端在 raw mode 下把 Ctrl+J 原样送出去，不经过
+      任何翻译，**哪个终端都一样**。所以它是那个「一定能用」的换行键。
+    - `Shift+Enter` 同 Alt+Enter，靠扩展键盘协议才有独立键名；顺手接上，
+      免得用户在支持的终端里按了却换不了行。
     """
 
-    class Submitted(Message):
+    class Submitted(TextualMessage):
         """用户按 Enter 提交了输入。"""
 
         def __init__(self, value: str) -> None:
@@ -63,7 +83,7 @@ class PromptArea(TextArea):
             super().__init__()
 
     async def _on_key(self, event: events.Key) -> None:
-        if event.key == "alt+enter":
+        if event.key in NEWLINE_KEYS:
             event.stop()
             event.prevent_default()
             # 走公开的 insert()，不用基类那个私有的 _replace_via_keyboard()。
@@ -144,3 +164,32 @@ def status_bar(provider: Provider | None) -> RenderableType:
     grid.add_column(justify="right")
     grid.add_row(Text(provider.name), Text(provider.model, style=DIM))
     return grid
+
+
+def transcript(messages: list[Message]) -> Group:
+    """把一次会话的历史拼成可直接打印到终端的块。
+
+    这是给**退出之后**用的（`docs/v1/checklist.md` 的 scrollback 那条要求
+    「退出后内容保留在终端历史中」）。
+
+    为什么要专门做这件事：Textual 跑在**备用屏幕**上（Linux 驱动启动时写
+    `\\x1b[?1049h`，退出时写 `\\x1b[?1049l`）。备用屏幕没有回滚缓冲，
+    退出的一瞬间整屏内容**连同它的滚动历史一起消失**——用户按完 /exit，
+    刚才聊的东西一点不剩。`RichLog` 能滚动，但只在进程活着的时候算数。
+
+    所以退出时把历史重新打一遍到主屏幕。这不是把界面内容「复制」出来
+    （那样会带上边框、状态栏这些只在交互时有意义的东西），而是按对话
+    本身重放一遍：用户说的、模型答的。
+
+    耗时不重放：那是「这一轮等了多久」，事后回看没有意义，只会干扰阅读。
+    """
+    blocks: list[RenderableType] = []
+    for msg in messages:
+        if msg.role == "user":
+            blocks.append(user_block(msg.content))
+        else:
+            # 助手回复按 markdown 重新渲染，代码块和列表才对（F8 的同一个理由）。
+            blocks.append(
+                Group(Text(MARKER, style=MARKER_STYLE), Markdown(msg.content))
+            )
+    return Group(*blocks)

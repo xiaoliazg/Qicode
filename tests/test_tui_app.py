@@ -11,6 +11,7 @@ compose、真正的消息分发、真正的键盘事件。所以这些用例验�
 import asyncio
 from collections.abc import Awaitable, Callable
 
+import pytest
 from textual.pilot import Pilot
 
 from qicode.config import ProviderConfig
@@ -167,13 +168,21 @@ def test_enter_submits_and_clears_input(make_config, make_provider) -> None:
     with_app([make_config()], scenario)
 
 
-def test_alt_enter_inserts_newline_instead_of_submitting(make_config) -> None:
-    """AC9：Alt+Enter 换行，而不是提交。"""
+@pytest.mark.parametrize("key", ["alt+enter", "shift+enter", "ctrl+j"])
+def test_newline_keys_insert_a_newline_instead_of_submitting(
+    make_config, key: str
+) -> None:
+    """AC9：三个换行键都换行，不提交。
+
+    为什么要三个：AC9 写的 Alt+Enter 在多数终端上发出来的是 `ESC CR`，被 Textual
+    归并成了普通 Enter（见 `view.PromptArea` 的类文档），按下去会把消息发出去；
+    `ctrl+j` 是 LF，各终端一致，是那个保底可用的。三个都得接住。
+    """
 
     async def scenario(app: QicodeApp, pilot: Pilot) -> None:
         area = app.query_one("#input", PromptArea)
         area.insert("第一行")
-        await pilot.press("alt+enter")
+        await pilot.press(key)
         area.insert("第二行")
         await pilot.pause()
 
