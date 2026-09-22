@@ -26,7 +26,7 @@ def main() -> None:
         print(f"qicode: {exc}", file=sys.stderr)
         raise SystemExit(1) from None
 
-    # banner 交给界面在 on_mount 里写进 RichLog，而不是在这里 print——
+    # 横幅交给界面在 on_mount 里挂进对话区（`MascotBanner`），而不是在这里 print——
     # 否则它会留在 Textual 接管屏幕**之前**的滚动缓冲里，两种输出混在一起。
     app = QicodeApp(cfg.providers)
     app.run()

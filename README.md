@@ -2,9 +2,10 @@
 
 终端 AI 编程助手（类似 Claude Code），Python + Textual 实现。
 
-> **状态：开发中。** v1 的目标是「多协议 LLM 终端对话客户端」——先打通人 ↔ LLM 的
-> 最小闭环，工具调用、权限、记忆等留到后续阶段。**现在还不能真正对话**，进度见
-> [docs/v1/task.md](docs/v1/task.md)。
+> **状态：v1 已实现，可以真正对话了。** v1 的目标是「多协议 LLM 终端对话客户端」——
+> 人 ↔ LLM 的最小闭环：多协议接入、流式输出、markdown 定型、多轮上下文、退出后回放。
+> 工具调用、权限、记忆等留到后续阶段。逐条验收证据见
+> [docs/v1/checklist.md](docs/v1/checklist.md)。
 
 ## 文档
 
@@ -17,7 +18,7 @@ spec.md（做什么）→ plan.md（怎么做）→ task.md（按什么顺序做
 - 索引与阶段表：[docs/README.md](docs/README.md)
 - 当前阶段 v1：[需求](docs/v1/spec.md) · [设计](docs/v1/plan.md) · [任务](docs/v1/task.md) · [验收](docs/v1/checklist.md)
 
-进度以 task.md 为准，本文件不另维护一份——两份必然对不上。
+进度以 `docs/README.md` 的阶段表为准，本文件不另维护一份——两份必然对不上。
 
 ## 环境要求
 
@@ -52,6 +53,24 @@ mkdir -p .qicode && cp .qicode/config.yaml.example .qicode/config.yaml
 ⚠️ v1 的 `api_key` 是纯字符串，**不做 `${ENV_VAR}` 之类的变量展开**。写成
 `${ANTHROPIC_API_KEY}` 会被当作密钥字面量发出去，最后撞一个认证失败。请直接填明文，
 靠 `.gitignore` 挡住。
+
+## 用法
+
+```bash
+cd <你的项目目录>     # 配置文件相对当前工作目录找
+qicode               # 或 python -m qicode
+```
+
+| 按键 | 作用 |
+|------|------|
+| `Enter` | 发送 |
+| `Ctrl+J` | 换行（**这个最可靠**：raw mode 下原样送出，哪个终端都一样） |
+| `Alt+Enter` / `Shift+Enter` | 换行（需要终端支持扩展键盘协议，如 Kitty / WezTerm / Ghostty） |
+| `/exit` | 退出 |
+| `Ctrl+C` | 退出（注意：因此输入框里不能用 Ctrl+C 复制；macOS 上可用 Cmd+C） |
+
+退出后本次会话会**重放到主屏幕**，之后能用终端自带的回滚方式翻看——Textual 跑在备用
+屏幕上，不重放的话退出的一瞬间就什么都不剩了。
 
 ## 开发
 

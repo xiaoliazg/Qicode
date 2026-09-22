@@ -195,8 +195,9 @@ class QicodeApp(App[None]):
         self._sync_chrome()
 
         if self.state is SessionState.IDLE:
-            # 必须显式给焦点：Textual 默认把焦点给第一个可聚焦的控件，
-            # 也就是最上面的 RichLog——那样用户一进来敲字是敲不到输入框里的。
+            # 必须显式给焦点：Textual 默认把焦点给第一个可聚焦的控件，而对话区
+            # 那个 `VerticalScroll` 就是可聚焦的（`can_focus = True`）——那样用户
+            # 一进来敲字是敲不到输入框里的。
             self.query_one("#input", PromptArea).focus()
 
     def watch_state(self, _old: SessionState, _new: SessionState) -> None:
