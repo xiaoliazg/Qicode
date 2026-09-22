@@ -23,7 +23,7 @@ build-backend = "hatchling.build"
 packages = ["src/qicode"]
 
 [dependency-groups]
-dev = ["pytest>=8", "ruff>=0.6", "mypy>=1.10"]
+dev = ["pytest>=8", "ruff>=0.6", "mypy>=1.10", "types-PyYAML>=6"]
 
 [tool.ruff]
 # 文档不参与 lint / format：`docs/` 里的 Python 代码块是说明性的，字段旁那些注释
