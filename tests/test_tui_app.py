@@ -986,3 +986,120 @@ def test_other_providers_keys_are_masked_too(make_config, make_provider) -> None
         [make_config(name="a", api_key=active), make_config(name="b", api_key=other)],
         scenario,
     )
+
+
+# ────────────────── 光标交给终端自己画（T23）──────────────────
+
+
+class SpyDriver:
+    """给真 driver 套一层，把写出去的控制序列记下来。
+
+    其余属性一律转发——Textual 在渲染和收尾路径上会读 `_driver.is_inline`
+    这类属性，少转发一个就当场 AttributeError。
+    """
+
+    def __init__(self, real: Any) -> None:
+        self._real = real
+        self.written: list[str] = []
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._real, name)
+
+    def write(self, data: str) -> None:
+        self.written.append(data)
+
+
+def test_cjk_input_is_never_eaten_by_the_cursor(make_config) -> None:
+    """**屏幕上那行字，必须跟打进去的一模一样**（T23 的回归锁）。
+
+    T21 的 `PromptArea.render_line` 用 `strip.crop(列, 列 + 1)` 判断「光标那一格
+    是不是空白」，而 `crop` 在**切不出完整宽度字符时会补一个空格**——实测对一句
+    中文切任意一格都返回 `' '`。于是中文的每一格都被判成空白，光标所在位置连同
+    旁边那个字被整格换成了 `▏`：光标每动一下，屏幕上就少一个字。
+
+    上面还叠了第二个错：`cursor_location.x` 是**字符索引**，代码却拿它当**显示列**
+    用，而中文一个字占两格，位置又偏掉一倍。
+
+    以前的用例是 `hello`——一个字符一格，两个判断恰好都成立，所以一路绿灯。
+
+    这条用例不碰实现：光标停在**每一个**字符位置上，显示都要跟 `area.text` 完
+    全相同。中英混排是为了把「一个字两格」和「一个字符一格」两种情况都盖到。
+    """
+
+    text = "就是正常的一个竖线 ok 不就好啦"
+
+    async def scenario(app: QicodeApp, pilot: Pilot) -> None:
+        area = app.query_one("#input", PromptArea)
+        area.text = text
+        for column in range(len(text) + 1):
+            area.cursor_location = (0, column)
+            await pilot.pause()
+            row = next(line for line in screen_lines(app) if "❯" in line)
+            assert text in row, f"光标停在第 {column} 个字符处时，那行显示成了 {row!r}"
+
+    with_app([make_config()], scenario)
+
+
+def test_terminal_cursor_follows_the_input_focus(make_config) -> None:
+    """终端光标的显示 / 隐藏跟着输入框的焦点走（T23）。
+
+    两个方向都得说清楚：
+
+    - **拿到焦点要放出来**：Textual 启动时把终端光标藏了
+      （`drivers/linux_driver.py` 的 `start_application_mode()` 里一句
+      `\\x1b[?25l`），然后自己在格子里画。我们把它放出来交给终端画——终端的
+      光标画在**格子的边界**上，不占格子，压在字上也不丢字，而格子里画不出
+      这种东西。
+    - **失去焦点要收回去**：光标是「键盘现在打给谁」的指示物。Qicode 里能抢
+      焦点的地方不止一处（多 provider 时的启动选择列表、被点中的对话区），
+      焦点走了还留一个光标在输入框里，看着就像那儿还能打字。Textual 失焦时
+      **不会**重置 `App.cursor_position`（`TextArea._watch_has_focus` 只
+      `_pause_blink`），这个收的动作只能我们自己来。
+
+    断言的是**写出去的字节**，不是 `view` 里的常量——常量被改错了用例要能红。
+    """
+
+    async def scenario(app: QicodeApp, pilot: Pilot) -> None:
+        area = app.query_one("#input", PromptArea)
+        real = app._driver
+        spy = SpyDriver(real)
+        app._driver = spy
+        try:
+            # 启动那一次（`on_mount` 里显式 focus）发生在替换之前，这里只测
+            # 焦点**变化**时写没写。
+            spy.written.clear()
+
+            area.blur()
+            await pilot.pause()
+            assert spy.written == ["\x1b[?25l"], "失焦没有把终端光标收回去"
+
+            spy.written.clear()
+            area.focus()
+            await pilot.pause()
+            assert spy.written == ["\x1b[?25h"], "聚焦没有把终端光标放出来"
+        finally:
+            app._driver = real
+
+    with_app([make_config()], scenario)
+
+
+def test_terminal_cursor_switch_is_a_noop_before_the_app_runs(make_config) -> None:
+    """`_driver` 还是 `None`（App 没跑起来）时，开关是空操作，不该炸。
+
+    正常流程里走不到：`_driver` 由 `App._process_messages` 在进消息循环**之前**
+    建好，所以 `on_focus` 触发时它一定不是 `None`。但 `QicodeApp` 是公开类，
+    裸构造出来再 `focus()` 一下也能摸到这条路。
+    """
+
+    async def scenario(app: QicodeApp, pilot: Pilot) -> None:
+        area = app.query_one("#input", PromptArea)
+        real = app._driver
+        app._driver = None
+        try:
+            area.blur()
+            area.focus()
+            await pilot.pause()
+        finally:
+            app._driver = real
+
+    with_app([make_config()], scenario)

@@ -163,23 +163,34 @@ class QicodeApp(App[None]):
         background: transparent;
     }
 
-    /* 光标压在**字**上的那一格：橙色下划线。
-       光标停在**空白格**上时由 `PromptArea.render_line` 画一根竖线 `▏`，
-       两条规则各管一半，见那个方法的文档。
+    /* 光标那一格：**交给终端自己画**，这里把 Textual 的绘制清成中性。
 
-       为什么要自己写：Textual 默认在聚焦时把光标画成**反色方块**
-       （`textual/widgets/_text_area.py` 的 `&:focus .text-area--cursor`：
-       `color: $input-cursor-foreground; background: $input-cursor-background;
-       text-style: reverse`），一格白底盖住一个字符，正是居居截图里那个白块。
+       `textual/widgets/_text_area.py` 聚焦时会给光标那一格的字符套上
+       `text-area--cursor` 样式（默认 `text-style: reverse`，一格白底盖住一个字符，
+       正是居居截图里那个白块）。而 Textual 一上来就把终端光标藏了
+       （`textual/drivers/linux_driver.py` 的 `start_application_mode()` 里一句
+       `\x1b[?25l`），所以屏幕上那个光标本来全是它画的。
 
-       `background: ansi_default` 是配套 `ansi_color` 的：让这一格**不要**背景色，
-       露出终端自己的底，否则方块光标去掉反色后还会剩一块主题色。
+       现在改成：`PromptArea` 聚焦时把终端光标放出来（`\x1b[?25h`，见
+       `qicode.tui.view._set_terminal_cursor`），Textual 这一格则清成「跟普通字符
+       长得一样」。**为什么要换**：格子里画不出不占格的竖线——终端是「一格一个
+       字符」的网格，想在两个字中间插一条线就得占掉一格（要么把那格的字挤掉，
+       要么整行往右挪），而终端自己的光标画在**格子的边界**上，不占格子，
+       压在字上也不丢字。
+
+       三个属性缺一不可：
+       - `color` / `background` 给 `ansi_default`：回到终端默认的前景 / 背景，
+         与输入框里别的字符一致（`background` 这条配套 `ansi_color`）。
+       - `text-style: none`：清掉默认那条 `reverse`。
+       - **规则不能写空**：`TextAreaTheme.apply_css` 的逻辑是「拿到的样式为空就
+         退回内置默认」，一条空规则等于没写，反色方块会原样回来。
+
        选择器照抄框架自己的写法（`TextArea .text-area--cursor`）——组件类样式
        就长这样，换成 `#input .text-area--cursor` 不一定能被匹配上。 */
     TextArea .text-area--cursor {
-        color: $accent;
-        text-style: underline;
+        color: ansi_default;
         background: ansi_default;
+        text-style: none;
     }
 
     #statusbar {
@@ -246,13 +257,7 @@ class QicodeApp(App[None]):
 
         with Horizontal(id="input-row"):
             yield Static("❯", id="prompt-symbol")
-            # 占位符开头**故意留一个空格**。
-            #
-            # 空输入时光标停在第 0 格，而 `PromptArea.render_line` 会把「光标那格
-            # 是空白」的情况画成一根竖线 `▏`——不留这个空格的话，被换掉的会是
-            # 占位符的第一个字符，屏幕上显示成 `❯▏end a message...`，像是把字吃掉
-            # 了。留一格当「光标位」，就变成 `❯▏Send a message...`，一个字不少。
-            yield PromptArea(id="input", placeholder=" Send a message...")
+            yield PromptArea(id="input", placeholder="Send a message...")
 
         yield Static("", id="statusbar")
 

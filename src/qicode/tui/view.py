@@ -15,17 +15,15 @@ from typing import Any
 
 from rich.console import Group, RenderableType
 from rich.markdown import Markdown
-from rich.segment import Segment
-from rich.style import Style
 from rich.table import Table
 from rich.text import Text
 from textual import events
+from textual.app import App
 from textual.containers import Horizontal
 
 # Textual 的消息基类跟对话消息重名。这个文件通篇讲的是「对话消息怎么画」，
 # 所以 `Message` 留给 `qicode.llm` 那个，Textual 的这个起个明确的别名。
 from textual.message import Message as TextualMessage
-from textual.strip import Strip
 from textual.widgets import Static, TextArea
 
 from qicode.agent import preview_args
@@ -68,16 +66,38 @@ SPINNER_FRAMES = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
 #: 在输入框里按下就换行（而不是提交）的键名。理由见 `PromptArea` 的类文档。
 NEWLINE_KEYS = frozenset({"alt+enter", "shift+enter", "ctrl+j"})
 
-#: 光标画成一根细竖线用的字符：`▏`（U+258F，左八分之一块）。
+#: 让**终端自己**的光标显示 / 隐藏（DEC 私有模式 25，`CSI ? 25 h/l`）。
 #:
-#: **为什么必须是「块元素」而不是 `|` 或 `│`。** Textual 是「一格一个字符」的
-#: 网格模型，画不出真正的 1px 竖线（那是终端自带光标的特权——它画在**格子的边界**
-#: 上，不占格子）。能在格子里表达「细竖线」的只有左八分之一块这类元素：它自己就
-#: 占满一格，但左边的八分之一有墨、右边透明，看过去就是一根贴左边缘的竖线。
+#: **为什么要动这个。** Textual 启动时会把终端光标藏起来
+#: （`textual/drivers/linux_driver.py` 的 `start_application_mode()` 里一句
+#: `\x1b[?25l`），改成自己在格子里画——默认画成反色方块，T21 改成了橙色下划线。
+#: 但**格子里画不出不占格的竖线**：终端是「一格一个字符」的网格，想在两个字中间
+#: 插一条线就得占掉一格，要么把那格的字挤掉（吞字），要么让整行往右挪（打字时
+#: 光标右边的字全在抖）。终端自己的光标没这个限制——它画在**格子的边界**上，
+#: 不占格子，所以压在字上也不丢字。
 #:
-#: 不用 `|` 是因为它上下留白，多行时会断成一截一截；不用 `▌`（左半块）是因为太粗，
-#: 看着就是个方块。宽度都得是 1，否则会把整行顶歪（同 `SPINNER_FRAMES` 那条取舍）。
-CURSOR_BAR = "▏"
+#: 实测（tmux，80×12）：不干预时 `#{cursor_flag}` 是 `0`（藏着的）；显式写一次
+#: `\x1b[?25h` 之后变成 `1`，并且跟着输入走（`#{cursor_x}` 2 → 7）。
+#:
+#: **位置不用我们操心。** Textual 每次渲染都会把光标移到 `App.cursor_position`
+#: （`textual/app.py` 里那句 `Control.move_to`），而 `TextArea` 在聚焦、光标移动、
+#: 选区变化时都会更新这个值。我们只管开关。
+CURSOR_SHOW = "\x1b[?25h"
+CURSOR_HIDE = "\x1b[?25l"
+
+
+def _set_terminal_cursor(app: App[Any], *, visible: bool) -> None:
+    """显示 / 隐藏**终端自己**的光标。
+
+    `app._driver` 是单下划线，mypy 不拦——**Textual 自己也是这么写的**
+    （`textual/app.py` 的 `copy_to_clipboard`：`if self._driver is None: return`，
+    然后 `self._driver.write(...)` 直接写控制序列）。driver 为 `None` 只有一种情形：
+    App 还没跑起来，那时候本来也没有终端可写。
+    """
+    driver = app._driver
+    if driver is None:
+        return
+    driver.write(CURSOR_SHOW if visible else CURSOR_HIDE)
 
 
 class PromptArea(TextArea):
@@ -127,11 +147,14 @@ class PromptArea(TextArea):
 
         # 光标**不许闪**。
         #
-        # Textual 的 `cursor_blink` 默认是开的，而它闪的方式是整格反色方块
-        # 「有 / 无」地切换。实测（每 0.25 秒采样 8 次）结果是四条白块、四条
-        # **完全看不到光标**——用户的感觉就是「这个输入框总是不聚焦」。
-        # 闪烁本来是用来在满屏光标里指出「键盘现在打给谁」，而 Qicode 只有一个
-        # 输入框、位置固定，闪动带来的只有干扰。
+        # 光标本体现在交给终端去画了（见 `_set_terminal_cursor`），这里管的是
+        # Textual 自己那一套还剩的半截。`cursor_blink` 默认开着，`_draw_cursor`
+        # 就会随 `_cursor_visible` 在「画 / 不画」之间反复切，那一个格子每 0.5 秒
+        # 被标脏重绘一次——而它的样式已经被 `QicodeApp.CSS` 清成了中性，重绘出来
+        # 跟前一帧一模一样。关掉，这一处白刷就没了。
+        #
+        # （关掉之后 `_draw_cursor` 恒等于 `has_focus`，也就是「聚焦就一直算画」。
+        # 那没关系：那条 CSS 让「画出来」和「不画」在屏幕上是同一个样子。）
         self.cursor_blink = False
 
         # 关掉 Textual 内置的「光标所在整行加亮」。
@@ -146,49 +169,30 @@ class PromptArea(TextArea):
         # 渲染路径把它盖住了，所以这个框只在打字时才冒出来。）
         self.highlight_cursor_line = False
 
-    def render_line(self, y: int) -> Strip:
-        """在光标那一格画一根细竖线（`CURSOR_BAR`）。
+    def on_focus(self, event: events.Focus) -> None:
+        """拿到焦点：把**终端自己的**光标放出来。
 
-        基类的绘制方式已经在 `QicodeApp.CSS` 里改过了（橙色下划线），但那是
-        「一格一个字符」的极限——**光标压在某个字上时**，下划线画在字底下、
-        字还在，可它就是不如一根竖线像光标。而光标停在空白格上时（空输入、
-        或者光标在行尾，也就是打字时绝大多数时刻）那一格本来就没内容，
-        换成 `▏` **一个字符都不会丢**，能画出跟终端原生竖线光标一样的观感。
+        **为什么挂在焦点事件上，而不是启动时开一次。** 光标是「键盘现在打给谁」
+        的指示物，它得跟着焦点走。Qicode 里能抢焦点的地方不止一处——多 provider
+        时的启动选择列表、被点中的对话区——焦点跑掉了还留一个光标在输入框里，
+        看着就像那儿还能打字。跟着 `Focus` / `Blur` 走，语义自然就是对的。
 
-        所以这里只在「那一格是空白」时动手，其余情况原样返回、交给 CSS：
-
-        - 空输入（占位符）→ 画 `▏`（占位符首字符那个位置，见下面占位符里的说明）
-        - 光标在行尾 → 画 `▏`
-        - 光标压在字上 → 不画，CSS 的橙色下划线接手
+        **为什么不去 `on_mount` 里补一次。** 时序上 `on_mount` 一定晚于 driver
+        就绪：`App._process_messages` 先建 driver、先跑
+        `start_application_mode()`（那一句 `\\x1b[?25l` 就是它写的），然后才进消息
+        循环跑 mount。所以两处都安全，但焦点事件是**每次都需要**的那一个，挂在
+        它上面就不必再单想「启动那一刻要不要特殊处理」。
         """
-        strip = super().render_line(y)
+        _set_terminal_cursor(self.app, visible=True)
 
-        # 失焦时不画。基类也是这个规矩（失焦连方块光标都不画），保持一致。
-        if not self.has_focus:
-            return strip
+    def on_blur(self, event: events.Blur) -> None:
+        """失去焦点：把终端光标收回去。
 
-        row, col = self.cursor_location
-        # 只处理光标所在那一行。`scroll_offset` 是**内容**偏移，减掉才换算成
-        # 「当前视口里的第几行」——`y` 是这个坐标系里的值。
-        if y != row - self.scroll_offset.y:
-            return strip
-        visible_col = col - self.scroll_offset.x
-        if not 0 <= visible_col < strip.cell_length:
-            return strip
-
-        # 这一格有没有东西？`crop` 按**显示宽度**切，宽字符、Tab 都不用自己算。
-        # 空格也算「没有东西」——把空格换成 `▏` 不丢任何可见内容。
-        cell = strip.crop(visible_col, visible_col + 1)
-        if cell.text.strip():
-            return strip
-
-        # 那一格是空的，换成竖线。左边原样保留，右边从「下一格」接上。
-        # 注意 `crop` 的右端是**开区间**，所以这里是 `visible_col + 1`。
-        accent = self.app.get_css_variables().get("accent", "#ffa62b")
-        bar = Strip([Segment(CURSOR_BAR, Style(color=accent))], 1)
-        before = strip.crop(0, visible_col)
-        after = strip.crop(visible_col + 1, strip.cell_length)
-        return before + bar + after
+        Textual 失焦时**不会**重置 `App.cursor_position`——`TextArea._watch_has_focus`
+        只停掉闪烁（`_pause_blink(visible=False)`），位置还原地留着。所以不收的话，
+        焦点走了而光标还在，就回到上面那句「看着像还能打字」。
+        """
+        _set_terminal_cursor(self.app, visible=False)
 
     async def _on_key(self, event: events.Key) -> None:
         if event.key in NEWLINE_KEYS:
