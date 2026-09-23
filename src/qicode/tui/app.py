@@ -78,6 +78,18 @@ class QicodeApp(App[None]):
 
     TITLE = "Qicode"
 
+    # 「默认背景 / 默认前景」原样交给终端，不折算成主题里的具体颜色。
+    #
+    # 不开这个开关（Textual 的默认值）时，`Color(0, 0, 0, ansi=-1)` 这个「终端默认
+    # 背景」会被解析成主题写死的 `$background`——深色主题里就是 `#121212`，于是
+    # Qicode 在自己的黑底上画整个界面。终端背景一换（浅色主题、半透明、带图片的），
+    # 那块黑就跟周围对不上，看着像「自己搞了个黑框框」。
+    #
+    # 实测：开关一翻，`App.screen.styles.background` 从 `Color(18, 18, 18)` 变成
+    # `Color(0, 0, 0, ansi=-1)`；tmux 抓转义，界面里**一个背景转义都没有**了
+    # （对照组：纯文本捕获本来就没有转义），也就是真的用上了终端自己的背景。
+    ansi_color = True
+
     # Ctrl+C 必须**自己抢**，而且必须 `priority=True`。
     #
     # Textual 8.x 的默认行为跟 F10 的期望不一样：App 把 ctrl+c 绑成 `help_quit`
@@ -135,6 +147,25 @@ class QicodeApp(App[None]):
         border: none;
         padding: 0;
         background: transparent;
+    }
+
+    /* 光标压在**字**上的那一格：橙色下划线。
+       光标停在**空白格**上时由 `PromptArea.render_line` 画一根竖线 `▏`，
+       两条规则各管一半，见那个方法的文档。
+
+       为什么要自己写：Textual 默认在聚焦时把光标画成**反色方块**
+       （`textual/widgets/_text_area.py` 的 `&:focus .text-area--cursor`：
+       `color: $input-cursor-foreground; background: $input-cursor-background;
+       text-style: reverse`），一格白底盖住一个字符，正是居居截图里那个白块。
+
+       `background: ansi_default` 是配套 `ansi_color` 的：让这一格**不要**背景色，
+       露出终端自己的底，否则方块光标去掉反色后还会剩一块主题色。
+       选择器照抄框架自己的写法（`TextArea .text-area--cursor`）——组件类样式
+       就长这样，换成 `#input .text-area--cursor` 不一定能被匹配上。 */
+    TextArea .text-area--cursor {
+        color: $accent;
+        text-style: underline;
+        background: ansi_default;
     }
 
     #statusbar {
@@ -198,7 +229,13 @@ class QicodeApp(App[None]):
 
         with Horizontal(id="input-row"):
             yield Static("❯", id="prompt-symbol")
-            yield PromptArea(id="input", placeholder="Send a message...")
+            # 占位符开头**故意留一个空格**。
+            #
+            # 空输入时光标停在第 0 格，而 `PromptArea.render_line` 会把「光标那格
+            # 是空白」的情况画成一根竖线 `▏`——不留这个空格的话，被换掉的会是
+            # 占位符的第一个字符，屏幕上显示成 `❯▏end a message...`，像是把字吃掉
+            # 了。留一格当「光标位」，就变成 `❯▏Send a message...`，一个字不少。
+            yield PromptArea(id="input", placeholder=" Send a message...")
 
         yield Static("", id="statusbar")
 

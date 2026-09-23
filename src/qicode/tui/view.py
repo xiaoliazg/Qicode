@@ -11,9 +11,12 @@
 """
 
 import re
+from typing import Any
 
 from rich.console import Group, RenderableType
 from rich.markdown import Markdown
+from rich.segment import Segment
+from rich.style import Style
 from rich.table import Table
 from rich.text import Text
 from textual import events
@@ -22,6 +25,7 @@ from textual.containers import Horizontal
 # Textual 的消息基类跟对话消息重名。这个文件通篇讲的是「对话消息怎么画」，
 # 所以 `Message` 留给 `qicode.llm` 那个，Textual 的这个起个明确的别名。
 from textual.message import Message as TextualMessage
+from textual.strip import Strip
 from textual.widgets import Static, TextArea
 
 from qicode.agent import preview_args
@@ -63,6 +67,17 @@ SPINNER_FRAMES = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
 
 #: 在输入框里按下就换行（而不是提交）的键名。理由见 `PromptArea` 的类文档。
 NEWLINE_KEYS = frozenset({"alt+enter", "shift+enter", "ctrl+j"})
+
+#: 光标画成一根细竖线用的字符：`▏`（U+258F，左八分之一块）。
+#:
+#: **为什么必须是「块元素」而不是 `|` 或 `│`。** Textual 是「一格一个字符」的
+#: 网格模型，画不出真正的 1px 竖线（那是终端自带光标的特权——它画在**格子的边界**
+#: 上，不占格子）。能在格子里表达「细竖线」的只有左八分之一块这类元素：它自己就
+#: 占满一格，但左边的八分之一有墨、右边透明，看过去就是一根贴左边缘的竖线。
+#:
+#: 不用 `|` 是因为它上下留白，多行时会断成一截一截；不用 `▌`（左半块）是因为太粗，
+#: 看着就是个方块。宽度都得是 1，否则会把整行顶歪（同 `SPINNER_FRAMES` 那条取舍）。
+CURSOR_BAR = "▏"
 
 
 class PromptArea(TextArea):
@@ -106,6 +121,74 @@ class PromptArea(TextArea):
             # 清空输入框的顺序就跟消息内容无关了。
             self.value = value
             super().__init__()
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+
+        # 光标**不许闪**。
+        #
+        # Textual 的 `cursor_blink` 默认是开的，而它闪的方式是整格反色方块
+        # 「有 / 无」地切换。实测（每 0.25 秒采样 8 次）结果是四条白块、四条
+        # **完全看不到光标**——用户的感觉就是「这个输入框总是不聚焦」。
+        # 闪烁本来是用来在满屏光标里指出「键盘现在打给谁」，而 Qicode 只有一个
+        # 输入框、位置固定，闪动带来的只有干扰。
+        self.cursor_blink = False
+
+        # 关掉 Textual 内置的「光标所在整行加亮」。
+        #
+        # `textual/widgets/_text_area.py` 的 DEFAULT_CSS 里有一条
+        # `& .text-area--cursor-line { background: $boost; }`，而 `$boost` 是
+        # `#FFFFFF0A`——**带 alpha 的** 4% 白。alpha 色要落地就得找个底色去叠，
+        # 而 `#input` 的 `background` 是 `transparent`（见 `QicodeApp.CSS`），
+        # 于是它叠在了「透明黑」上：`255 × 10/255 = 10`，合出来正好是 `#0A0A0A`。
+        # 也就是说，**有字之后整条输入行会被涂上一层近黑色**，在浅色终端上就是
+        # 居居说的那个「自己搞的黑框框」。（空输入时看不见，是因为占位符那条
+        # 渲染路径把它盖住了，所以这个框只在打字时才冒出来。）
+        self.highlight_cursor_line = False
+
+    def render_line(self, y: int) -> Strip:
+        """在光标那一格画一根细竖线（`CURSOR_BAR`）。
+
+        基类的绘制方式已经在 `QicodeApp.CSS` 里改过了（橙色下划线），但那是
+        「一格一个字符」的极限——**光标压在某个字上时**，下划线画在字底下、
+        字还在，可它就是不如一根竖线像光标。而光标停在空白格上时（空输入、
+        或者光标在行尾，也就是打字时绝大多数时刻）那一格本来就没内容，
+        换成 `▏` **一个字符都不会丢**，能画出跟终端原生竖线光标一样的观感。
+
+        所以这里只在「那一格是空白」时动手，其余情况原样返回、交给 CSS：
+
+        - 空输入（占位符）→ 画 `▏`（占位符首字符那个位置，见下面占位符里的说明）
+        - 光标在行尾 → 画 `▏`
+        - 光标压在字上 → 不画，CSS 的橙色下划线接手
+        """
+        strip = super().render_line(y)
+
+        # 失焦时不画。基类也是这个规矩（失焦连方块光标都不画），保持一致。
+        if not self.has_focus:
+            return strip
+
+        row, col = self.cursor_location
+        # 只处理光标所在那一行。`scroll_offset` 是**内容**偏移，减掉才换算成
+        # 「当前视口里的第几行」——`y` 是这个坐标系里的值。
+        if y != row - self.scroll_offset.y:
+            return strip
+        visible_col = col - self.scroll_offset.x
+        if not 0 <= visible_col < strip.cell_length:
+            return strip
+
+        # 这一格有没有东西？`crop` 按**显示宽度**切，宽字符、Tab 都不用自己算。
+        # 空格也算「没有东西」——把空格换成 `▏` 不丢任何可见内容。
+        cell = strip.crop(visible_col, visible_col + 1)
+        if cell.text.strip():
+            return strip
+
+        # 那一格是空的，换成竖线。左边原样保留，右边从「下一格」接上。
+        # 注意 `crop` 的右端是**开区间**，所以这里是 `visible_col + 1`。
+        accent = self.app.get_css_variables().get("accent", "#ffa62b")
+        bar = Strip([Segment(CURSOR_BAR, Style(color=accent))], 1)
+        before = strip.crop(0, visible_col)
+        after = strip.crop(visible_col + 1, strip.cell_length)
+        return before + bar + after
 
     async def _on_key(self, event: events.Key) -> None:
         if event.key in NEWLINE_KEYS:
