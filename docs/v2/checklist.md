@@ -21,6 +21,28 @@
 >
 > **没有**用仓库里那份 `.qicode/config.yaml`，从头到尾没读它（只 grep 过 `name` /
 > `protocol` / `model` / `base_url` 这类结构行）、没改它。
+>
+> ---
+>
+> **二次回填：2026-09-23（T19，硬伤修复）。** v2 交付后做了一次三层代码审查，查出三个
+> 硬伤（成因、修法、反向证明见文末「T19 硬伤修复记录」）。修完回头核这份 checklist，
+> 发现**有 5 条当初是虚勾的**——打勾时给的证据都真实，但**只覆盖了顺利路径**，而硬伤
+> 恰恰长在证据没盖到的那片输入空间里：
+>
+> | 条目 | 当初的证据 | 漏掉的输入空间 | 当时实际的后果 |
+> |---|---|---|---|
+> | AC4 `edit_file` | ASCII 内容 + LF 文件 | CRLF 文件、非 UTF-8 文件 | 静默改坏整个文件 |
+> | AC5 `bash` 超时 | `sleep 40`（单命令） | 管道 / `&&` 链式命令 | 超时后 `wait()` 永不返回，请求挂死 |
+> | AC6 `grep` | 普通关键字 | 正则的**形状** | 灾难性回溯把界面冻死 |
+> | N2 不阻塞界面 | `sleep 40` 期间界面能刷新 | 灾难性回溯 | 连 `wait_for` 都不触发，只能 `kill -9` |
+> | AC13/N5 体量受控 | 三个上限都验了 | 上限之外文件有没有被动过 | （与 AC4 同源） |
+>
+> **教训**：一条勾只代表**它证据覆盖到的范围**，不代表那条需求成立。这 5 条已按更宽的
+> 输入空间重跑，下面每条都标了「**T19 补**」；勾保留，因为它们现在**真的有证据**了。
+>
+> T19 的实跑目录仍是 `/tmp/qicode_e2e`（配置同下表），另造三个夹具：`crlf.txt`
+> （CRLF 三行）、`latin1.txt`（ISO-8859 编码）、`stress/bomb.txt`（80 个 `a` + `!`，
+> 用来触发灾难性回溯）。
 
 ## 实现完整性
 
@@ -31,11 +53,16 @@
 - [x] write_file 创建/覆盖文件，父目录自动创建（验证：单测用 `tmp_path/"a/b/c.txt"` 后读回内容一致；另测 `content` 为空串时不被误判成缺参数）。(AC3/F2)
   **证据 ③：** ① `test_write_file_creates_nested_paths` / `_overwrites` / `_allows_empty_content` / `_requires_content_key`；② tmux 实跑「新建文件 out/hello.txt 写入内容 琪琪来啦」→ `⎿ 已写入 out/hello.txt（12 字节）`，`out/` 这个不存在的父目录被自动建出来。
 - [x] edit_file 唯一匹配替换成功；0 处与 >1 处返回**可区分**错误（含匹配数）（验证：单测三情形，断言文案两两不同且 >1 那条含 N）。(AC4/F2)
-  **证据 ③：** ① `test_edit_file_replaces_unique_match`、`test_edit_file_reports_distinguishable_errors[...未找到匹配]`、`[...匹配到 2 处]`、`test_edit_file_error_messages_differ_between_zero_and_many`；② tmux 实跑「把 notes.txt 里的『不存在的这句话』改成『新值』」→ `⎿ 未找到匹配的内容。`old_string` 必须与文件内容逐字符一致（包括缩进和换行），请先 read_file 确认原文。`
+  **证据 ③：** ① `test_edit_file_replaces_unique_match`、`test_edit_file_reports_distinguishable_errors[...未找到匹配]`、`[...匹配到 2 处]`、`test_edit_file_error_messages_differ_between_zero_and_many`；② tmux 实跑「把 notes.txt 里的『不存在的这句话』改成『新值』」→ 结果行「未找到匹配的内容。`old_string` 必须与文件内容逐字符一致（包括缩进和换行），请先 read_file 确认原文。」（原文这里把整段套在了一个代码段里，里面还嵌了 `` `old_string` ``，渲染会断开，T19 顺手改成引号包裹。）
+  **T19 补（原证据只有 ASCII + LF，补 CRLF 与非 UTF-8）：** ① 新增 `test_edit_file_keeps_crlf_line_endings`、`test_edit_file_matches_lf_old_string_against_a_crlf_file`、`test_edit_file_refuses_non_utf8_instead_of_replacing_bytes`、`test_edit_file_leaves_untouched_lines_byte_identical`。② tmux 实跑「把 `crlf.txt` 的前两行 `first line` / `second line` 整体换成 `第一条` / `第二条`（保持两行）」→ 模型给的 `old_string` 里是 `\n`，工具走第二遍 CRLF 匹配 → `⎿ 已修改 crlf.txt`；落盘后逐字节核：**3 个 CRLF、0 个裸 LF、0 个裸 CR**，`file` 仍判 `with CRLF line terminators`，未动的第三行逐字节不变。③ tmux 实跑「用 edit_file 改 `latin1.txt`」→ `⎿ latin1.txt 不是 UTF-8 文本（'utf-8' codec can't decode byte 0xe9 in position 3: invalid continuation byte），本工具不修改它。请先用 bash 确认它的真实编码。`；**md5 前后完全一致**（`c6129cbb…`），原始字节 `caf 351 na 357 ve` 原样还在。
+    **这两条在修复前都是「静默改坏」**：`read_text` 的 `errors="replace"` 把非 UTF-8 字节换成 U+FFFD、universal newlines 把 `\r\n` 折成 `\n`，然后**整篇写回**——改一个字节的地方，动整个文件。
 - [x] bash 返回 stdout/stderr/退出码；**非零退出是 `is_error` 但内容完整**；超时命令被终止并返回超时结果（验证：单测 `echo hi`、`false`、注入极短超时跑 `sleep 5`）。(AC5/F2/N1)
   **证据 ③：** ① `test_bash_returns_stdout_and_zero_exit` / `_nonzero_exit_is_error_but_keeps_output` / `_timeout_is_reported_and_kills_the_process`；② tmux 实跑 `ls -l ... && stat -c ...`（macOS 的 BSD stat 不认 `-c`）→ `⎿ exit_code: 1` + stdout、stderr 两段都完整回灌，模型据此解释了报错原因；实跑 `sleep 40` → `⎿ 工具 bash 执行超时（30 秒）`，`DEFAULT_TIMEOUT = 30.0` 生效。
+  **T19 补（原证据是 `sleep 40` 这条「单命令」，补管道与链式）：** ① 新增 `test_bash_timeout_returns_promptly_for_pipelines_and_chained_commands`、`test_bash_timeout_kills_the_whole_process_tree`。② tmux 实跑真管道 `sleep 45 | cat` → 第 13s / 21s 两次捕获转轮帧都在变（界面没冻），约 30 秒返回 `⎿ 工具 bash 执行超时（30 秒）`；跑完 `pgrep -fl "sleep 45"` → **无孤儿**。
+    **修复前这里是永久挂死**：`sh -c` 拉起的管道子进程是 `sh` 的**孙进程**，`await proc.wait()` 不只要等进程退出，还要等所有管道 EOF（`BaseSubprocessTransport._try_finish` 要求 `_pipes` 全部断开）；孙进程握着写端不放，那个 EOF 永远不来。`sleep 40` 之所以能过，只是因为它没有管道。修法是 `start_new_session=True`（`setsid()`，让 `sh` 当进程组组长）+ 超时时 `os.killpg(SIGKILL)` 杀**整组**。
 - [x] glob 列出匹配文件；grep 返回 `file:line:content`（验证：单测 `**/*.py` 命中、关键字 grep 命中）。(AC6/F2)
   **证据 ③：** ① `test_glob_finds_files_recursively`、`test_grep_reports_file_line_and_content`、`test_grep_honours_glob_filter`；② 直接调 `registry.execute` 实跑 `grep 工具 docs/v2` → 首行 `checklist.md:1:# v2 工具系统 Checklist`，`file:line:content` 格式成立。
+  **T19 补（原证据只有普通关键字，补正则的「形状」）：** ① 新增 `test_grep_stops_a_catastrophic_regex_instead_of_freezing`、`test_grep_still_matches_a_long_line_within_the_budget`、`test_grep_leaves_the_alarm_handler_as_it_found_it`。② tmux 实跑 `grep({"pattern": "(a+)+$", "path": "stress"})`（夹具 `bomb.txt` = 80 个 `a` + `!`）→ 结果行「正则 `(a+)+$` 在 bomb.txt:1 上匹配超过 1 秒仍未结束，已中止搜索。这通常是嵌套量词（如 `(a+)+`）在长行上引发的灾难性回溯，请改写 pattern 让它更具体。」，界面无卡顿，模型据此自行改写 pattern。③ 修复前的标度实测：n=20 → 0.06s、n=24 → 0.89s、n=26 → 3.60s、n=28 → 14.46s（≈每多一个字符 ×4），n=60 已属「几小时」；修复后 n=28 / 60 / 200 一律 **1.00 秒**返回，正常搜索仍是 0.0003 秒（没被殃及）。
 - [x] glob / grep **无命中是 `is_error=False`** 的正常结果，不是错误（验证：单测搜一个绝不存在的关键字，断言 `is_error is False` 且文案含「无命中」）。(F9 的边界)
   **证据 ③：** ① `test_glob_no_match_is_not_an_error`、`test_grep_no_match_is_not_an_error`；② 直接调工具实跑：grep `绝不存在的关键字zzz` → `无命中：没有任何文件内容匹配 ...`（`is_error=False`）；glob `**/*.py` on `docs/` → `无匹配：没有文件符合模式 ...`（`is_error=False`）。
 - [x] 流式工具调用解析正确：模型一次回复的工具名与完整 JSON 参数被拼齐（验证：agent fake 单测断言 `input` 是完整 JSON；openai 侧另测两个工具**交错分片**能各拼各的；端到端发「读 X 文件」，工具行参数与请求一致）。(AC7/F4)
@@ -70,12 +97,15 @@
   **证据 ①：** `grep -rn "add_assistant" src/qicode/tui/` 只剩两处，都在**注释**里（`app.py:408`、`app.py:520`），写的是「v1 在这里写历史，v2 不写」——没有任何一处是真的调用。
 - [x] 工具执行不阻塞界面：执行期间工具行显示 `name(args) Running…` 指示，界面可响应（验证：让模型跑一个稍慢的 bash（如 `sleep 3`），观察界面持续刷新、能滚动，asyncio event loop 不卡顿）。(N2)
   **证据 ②：** tmux 实跑 `sleep 40`（会在 30 秒处超时）：对话区出现 `● ⠋ bash({"command": "sleep 40 && echo \"done\""}) Running…`，等待期间转轮持续换帧（相隔 1 秒两次捕获分别拿到 `⠋` 和 `⠧`）——事件循环没被工具阻塞；这 30 秒里还把窗口从 120×40 缩到 72×30，界面立刻按新宽度重排。
+  **T19 补（原证据用 `sleep 40`，补真正的「C 调用卡住」反例）：** AC5 / AC6 那两次 tmux 实跑同时验了这条——`sleep 45 | cat` 等待的 30 秒里转轮持续换帧（13s / 21s 两帧不同），`(a+)+$` 那次 1 秒内返回且界面可响应。
+    **为什么这条当初会虚勾**：`sleep` 是**会让出 CPU 的**，事件循环本来就轮得转，所以它验不出「界面被卡死」。真正的反例是同步 C 调用——`re.search` 匹配期间**全程持有 GIL**，实测 60 字符输入下 `asyncio.wait_for(20s)` 不触发，另起一个准备 25 秒后 `os._exit` 的看门狗线程也**没能执行**（抢不到 GIL），进程只能 `kill -9`。也就是说对这类卡顿，「丢线程 / 加超时」全都无效，只有信号（处理器跑在主线程、不需要抢 GIL）能救。
 - [x] 对话区顺序正确：preamble 文本 → 工具行 → 结果摘要 → 最终答复 按序出现不交错（验证：多工具任务后回看对话区顺序；单 event loop 内 `VerticalScroll.mount()` 按事件顺序追加保序）。(F8)
   **证据 ③：** ① `tests/test_tui_app.py` 的三块顺序用例；② tmux 实跑「先读 demo.txt，再读 notes.txt」→ 一次请求里两个调用，对话区依次是 `● read_file(demo.txt)` / `⎿ …` / `● read_file(notes.txt)` / `⎿ …` / 最终答复，没有交错。
 - [x] 工具执行期间**不改动已定型的块**：结果摘要出现后，后续正文另开新块，不会把结果顶走（验证：端到端观察「工具行 → 最终答复」两块的边界，答复出现时结果摘要原地不动）。(F8)
   **证据 ③：** ① `test_tool_round_renders_preamble_tool_row_then_final_reply`（三块类型恰为 `ReplyBlock / ToolBlock / ReplyBlock`，且开场白与 `⎿ 1→hello` 在最终答复出现后仍在屏上）、`test_empty_preamble_leaves_no_blank_reply_block`；② tmux 实跑全程：每个工具结果摘要都在最终答复出现后原地不动，答复是另一个带 `●` 的块。
 - [x] 结果体量受控：读大文件 / 长输出 bash / 海量 grep 命中被工具级上限截断并标注 `[truncated]`，不撑爆界面/上下文（验证：读一个 >2000 行文件、跑长输出命令观察截断）。(AC13/N5)
   **证据 ③：** ① `test_truncate_marks_line_overflow` / `_marks_char_overflow` / `test_read_file_truncates_long_file`；② 直接调 `registry.execute` 实跑三例——`read_file big.txt`（2500 行）→ 2001 行、末行 `[truncated]`；`bash seq 1 20000` → 6221 行、末行 `[truncated]`（`MAX_OUTPUT_CHARS = 30000` 先触发）；`grep 工具 docs/v2` → 100 条 + `…（命中太多，只显示前 100 条。请把 pattern 写得更具体，或用 glob 限定文件范围）`。③ tmux 里 `read_file big.txt` 的界面表现：只画 8 行 + `… 还有 1993 行（完整内容已回灌给模型）`。
+  **T19 补（原证据只验了三个上限，补「上限之外文件有没有被动过」）：** 重跑三例，数字与上一条逐字一致（2500 行 → 2001 行 + `[truncated]`；`seq 1 20000` → 6221 行 + `[truncated]`；`grep 工具 docs/v2` → 100 条 + 提示），并额外做了 `big.txt` 的 md5 前后比对 → **未变**。「截断」是**只读**路径上的事，跟 AC4 的写路径分开看：读的宽容（`errors="replace"`）不会落盘，写的必须严格。
 - [x] 退出回放认得工具回合：`/exit` 后工具行与结果摘要按原样重放到终端，不被当成正文整段印出（验证：跑一次工具任务后 `/exit`，翻终端回滚）。(AC11/F8)
   **证据 ②：** tmux 实跑一整场会话（8 轮、含 9 次工具调用）后按 `/exit`，翻回滚缓冲：每个工具轮都重放成「调用行 + `⎿` 结果行」，与对话区里同一版式；`ROLE_TOOL` 那条空 content 不再画成光秃秃的 `●`。
 - [x] 系统提示词体现 Agent 角色：问「你能做什么」答复提及可用工具能力（验证：发一条询问，观察答复）。(F3)
@@ -91,8 +121,11 @@
   **证据：** `36 files already formatted`
 - [x] `pytest -v` 通过（`tests/test_tool.py`、`tests/test_agent.py` 新建并全绿；`test_tui_stream.py` 已随 `stream.py` 删除）。
   **证据：** `pytest -q` → **233 passed**。按文件分：`tests/test_tool.py` 45 条、`tests/test_llm_providers.py` 49 条、`tests/test_tui_app.py` 35 条、`tests/test_tui_view.py` 18 条（T17 新建）、`tests/test_agent.py` 17 条，全部通过。
+  **T19 复核（数字更新）：** `pytest -q` → **249 passed**。按文件分：`test_tool.py` **55**、`test_llm_providers.py` **50**、`test_tui_app.py` 35、`test_tui_view.py` **19**、`test_agent.py` **21**、`test_config.py` 30、`test_conversation.py` 9、`test_prompt.py` 9、`test_redact.py` 8、`test_tui_select.py` 7、`test_cli.py` 6。
+    **233 → 249 的 +16 拆得开**：T19 这轮加 **10** 条（全在 `test_tool.py`，覆盖三个硬伤）；另外 **6** 条是 T18 之后「工具行中文转义」那次提交（`69112b7`）加的——`test_agent.py` +4、`test_llm_providers.py` +1、`test_tui_view.py` +1，该提交信息里记的就是 **239 passed**（233 + 6）。
 - [x] `mypy src/qicode/` 通过。
   **证据：** `Success: no issues found in 22 source files`
+  **T19 复核：** 上面四条（`ruff check .` / `ruff format --check .` / `pytest -q` / `mypy src/qicode/`）在三个硬伤修完后全部重跑，除了 `pytest` 的条数，输出逐字未变（`All checks passed!` / `36 files already formatted` / `Success: no issues found in 22 source files`）。
 - [x] 异步测试**没有**引入 `pytest-asyncio`（验证：`grep -n "pytest-asyncio\|asyncio_mode" pyproject.toml` 无输出，新测试全用 `asyncio.run`）。(plan 技术决策「异步测试怎么写」)
   **证据 ①：** `grep` 无输出；`tests/test_agent.py` 与非流式的 provider 用例全部是同步 `def test_...` 里包一个 `asyncio.run(...)`。
 - [x] 密钥不回显/不打印：对话区与任何输出均不出现 `api_key`；工具执行结果里也不带（验证：通读运行输出、检索无明文 key）。(N6)
@@ -163,3 +196,74 @@
   也就是说「工具自己截过」这件事，界面用户看不到，只有模型看得到。
   本次实跑里是模型自己在答复里说出来的（「末尾标注 `[truncated]`」）。是否要在界面上
   也提示，留待后续决定。
+
+## T19 硬伤修复记录（2026-09-23）
+
+v2 交付后做了一次三层代码审查（工具层 / 适配器层 / TUI 层，各由一个独立子代理跑），
+查出三个「硬伤」——不是风格问题，是会**丢数据、挂死进程**的那类。下面的数字都是实跑出来的。
+「反向证明」指的是**把修复逻辑撤掉，确认用例确实失败**——不这么做就无法排除「这个用例
+本来就过」，那单测绿了就说明不了任何事。
+
+### 硬伤 1 · `bash` 超时后请求永久挂死
+
+- **症状**：`sleep 40` 能正常超时，但 `sleep 45 | cat` 这类**管道**或 `a && b` **链式**
+  命令超时后，整个请求再也不返回——界面停在 `Running…` 不动，只能杀进程。
+- **根因**：`asyncio.create_subprocess_shell` 实际执行的是 `sh -c "..."`，管道里的
+  `cat` 是 `sh` 的**孙进程**。`await proc.wait()` 不只要等进程退出，还要等**所有管道
+  EOF**（`BaseSubprocessTransport._try_finish` 要求 `_pipes` 全部断开，而读端 EOF 得等
+  所有写端先关）。杀了 `sh`，孙进程还攥着写端，EOF 永远不来。`sleep 40` 之所以看着正常，
+  只是因为它**没有管道**——这正是这条当初虚勾的原因。
+- **修法**：`start_new_session=True`（内部 `setsid()`，让 `sh` 成为**进程组组长**），
+  超时时 `os.killpg(os.getpgid(proc.pid), SIGKILL)` 杀**整组**。
+- **成效**：超时后 **0.50 秒**返回；`pgrep` 确认无孤儿。
+- **反向证明**：撤掉修法后重跑新用例 → `wait()` 挂死；另用一个「每 5 秒追加内容」的
+  哨兵文件观察，它从 65 字节涨到 90 字节（证明孙进程还活着）。
+
+### 硬伤 2 · `edit_file` 静默改坏文件
+
+- **症状**：改 CRLF 文件 → 整篇被折成 LF；改非 UTF-8 文件 → 坏字节变成 `U+FFFD` 后
+  写回。两种都是**静默**的：工具返回「已修改」，用户和模型都察觉不到。
+- **根因**：`Path.read_text` / `write_text` 的默认值都在动内容——`errors="replace"`
+  把解不开的字节换成 `U+FFFD`，universal newlines 把 `\r\n` 折成 `\n`，写回时再按
+  `os.linesep` 展开。**只改一个字节的地方，动了整个文件。**
+- **修法**：`read_bytes` → **严格** `decode("utf-8")`（解不开就拒绝，不猜编码）→ 匹配
+  （先按原样，不中再把 `\n` 换成 `\r\n` 试第二遍）→ 替换时让 `new_string` 的行尾跟
+  **匹配到的原文**对齐 → `write_bytes`。
+- **为什么必须有第二遍匹配**：模型手里的 `old_string` 抄自 `read_file`，而 `read_file`
+  走 universal newlines，**给模型看的行尾一律是 `\n`**；CRLF 文件里的真实字节却是
+  `\r\n`。少了这一步，模型在 CRLF 项目里永远匹配不上跨行的 `old_string`，而它收到的
+  错误提示（「必须逐字符一致」）会把它引向完全错误的方向。
+- **反向证明**：撤掉修法后，CRLF / 非 UTF-8 / 未触碰行三个场景**全被改坏**。
+
+### 硬伤 3 · `grep` 灾难性回溯冻死界面
+
+- **症状**：`(a+)+$` 这类嵌套量词作用在长行上，界面**完全冻死**，连 Ctrl+C 都按不动。
+- **根因**：`re` 是回溯式引擎，标度实测 ≈ **每多一个字符 ×4**（n=20 → 0.06s、
+  n=24 → 0.89s、n=26 → 3.60s、n=28 → 14.46s；n=60 已属「几小时」）。而 `re.search`
+  是同步 C 调用，卡住时事件循环连取消回调都跑不了——**`Registry` 那层 30 秒的
+  `wait_for` 形同虚设**。更狠的是 `_sre` 匹配期间**全程持有 GIL**：实测 60 字符输入下
+  `wait_for(20s)` 不触发，另起一个准备 25 秒后 `os._exit` 的看门狗线程也**没能执行**
+  （抢不到 GIL），只能 `kill -9`。
+- **修法**：`SIGALRM` 给每次匹配掐 1 秒表（`grep_tool.MATCH_BUDGET`）。它**是唯一**
+  能真正中断的办法——信号处理器跑在**主线程**、不需要抢 GIL，而 CPython 的 `_sre` 在
+  匹配循环里会周期性调用 `PyErr_CheckSignals()`（Ctrl+C 能打断跑疯的正则，靠的就是它），
+  所以处理器里抛的异常能从匹配内部**真正中断**它。搜索期间装处理器、结束**还原**
+  （`SIGALRM` 的默认动作是杀进程，残留下来属于查不出来的那类 bug）。
+- **降级**：Windows 没有 `SIGALRM`、非主线程装不上，两种情况都退成「不掐表」——工具还
+  能用，不会一上来就报错。
+- **成效**：n=28 / 60 / 200 一律 **1.00 秒**返回；正常搜索 0.0003 秒，没被殃及。
+- **反向证明**：把预算调大（等价于旧逻辑）跑同一个用例，外层 25 秒硬超时 → 退出码
+  **137**（SIGKILL），连 pytest 的收集信息都没输出。
+
+### 这一轮真正学到的东西
+
+**「丢进线程 / 加个超时」不是万能药。** 对**会主动让出 CPU** 的阻塞（文件 IO、
+`sleep`）它们有效；对**同步 C 调用**（`re.search`、某些解析器）无效——那种情况下别的
+线程连 GIL 都抢不到，杀也杀不动。判据是：**这段代码会不会主动让出 GIL**。这直接决定了
+`read_file`（可以 `to_thread`）和 `grep`（不能，而且 `to_thread` 还会同时废掉
+`await asyncio.sleep(0)` 的让出效果、以及信号那层保护）为什么走两条不同的路。
+
+**另一条**：「一条 checklist 勾只代表它证据覆盖到的范围」。这一轮 5 条虚勾，全都是因为
+打勾时挑的输入**恰好绕开了**缺陷所在的那片空间（单命令 vs 管道、ASCII+LF vs CRLF+非
+UTF-8、普通关键字 vs 恶意正则）。写验收证据时值得专门问一句：**「我挑这个输入，是因为
+它有代表性，还是因为它跑得通？」**

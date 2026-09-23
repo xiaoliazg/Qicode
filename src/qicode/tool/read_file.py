@@ -25,8 +25,19 @@ def _read_head(path: str) -> str:
 
     这是个**同步**函数，由调用方丢进工作线程跑（见 `execute`）。写成同步的而不是
     `async def` 是有意的：文件 IO 没有异步版本，硬套 `async` 只是把阻塞换个地方放。
+
+    三处编码相关的选择，都是刻意的：
+
+    - `encoding="utf-8"` 写死不跟随 locale。不写的话，在 `LC_ALL=C` 的环境里
+      （容器、CI、cron 中很常见）读中文文件会整篇变成 `\\ufffd`。
+    - 这里**保留** `errors="replace"`：读是只读操作，替换掉坏字节顶多让模型看到几个
+      `\\ufffd`，磁盘上的数据一个字节都没动。`edit_file` 那边就不能这么宽容——它要
+      写回去，被替换过的内容会**落盘**，所以那边是严格解码、解不开就拒绝。
+    - `newline` 不指定，用默认的 universal newlines（`\\r\\n` → `\\n`）。这正是要给模型
+      看的形状：它不必知道文件的换行风格，抄回来的 `old_string` 也统一是 `\\n`。
+      把这件事翻译回真实字节是 `edit_file` 的责任。
     """
-    with Path(path).open("r", errors="replace") as handle:
+    with Path(path).open("r", encoding="utf-8", errors="replace") as handle:
         return handle.read(MAX_CHARS + 1)
 
 

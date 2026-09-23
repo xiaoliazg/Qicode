@@ -17,7 +17,13 @@ def _write(target: Path, content: str) -> None:
     # `parents=True` 连同中间层一起建；`exist_ok=True` 让「父目录已经有了」不算错。
     # 裸文件名（如 `a.txt`）的 parent 是 `.`，建它也是无害的空操作。
     target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_text(content)
+    # `encoding` 写死 UTF-8（理由同 `read_file._read_head`）：不写就跟随 locale，
+    # 在 `LC_ALL=C` 下写中文会直接抛 `'ascii' codec can't encode`。
+    #
+    # `newline=""` 是「原样写，不做换行转换」。默认的 `newline=None` 会把 `\n` 翻译成
+    # `os.linesep`——在 macOS / Linux 上恰好就是 `\n`，看着毫无问题，可到了 Windows 上
+    # 会变成 `\r\n`，那就不是模型说的东西了。
+    target.write_text(content, encoding="utf-8", newline="")
 
 
 class WriteFileTool:
@@ -66,4 +72,5 @@ class WriteFileTool:
         except OSError as exc:
             return Result(f"写入失败: {path}: {exc}", is_error=True)
 
-        return Result(f"已写入 {path}（{len(content.encode())} 字节）")
+        # 字节数按 UTF-8 算——落盘用的就是它，报出来的数字和磁盘上的必须是一回事。
+        return Result(f"已写入 {path}（{len(content.encode('utf-8'))} 字节）")

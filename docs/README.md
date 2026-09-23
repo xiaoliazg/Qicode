@@ -59,11 +59,17 @@ spec.md（做什么）→ plan.md（怎么做）→ task.md（按什么顺序做
 
 设计文档：[需求](v2/spec.md) · [设计](v2/plan.md) · [任务](v2/task.md) · [验收](v2/checklist.md)。
 
-验收状态：`docs/v2/checklist.md` 逐条记录了证据（33 项勾上，2 项留空）。**唯一的缺口是
+验收状态：`docs/v2/checklist.md` 逐条记录了证据（**35 项勾上，0 项留空**）。**唯一的缺口是
 官方 `api.anthropic.com` 真机链路**——`AnthropicProvider` 这条代码路径是跑过的（DeepSeek
 的 anthropic 兼容端点），没跑过的是官方服务本身（`thinking` 块结构、官方 `stop_reason`
 语义）。「两协议一致」那条用同一个 key、同一个模型只换 `protocol` / `base_url` 做了对照，
 见 checklist 末尾的「跨协议 A/B」。
+
+> 📌 **交付后经一次硬伤修复（T19，2026-09-23）。** v2 交付后做了三层代码审查，查出三个
+> 硬伤：`bash` 超时在管道命令上永久挂死、`edit_file` 会静默改坏 CRLF / 非 UTF-8 文件、
+> `grep` 的灾难性回溯冻死界面。修完后回头核验收记录，发现 **5 条当初的证据只覆盖了顺利
+> 路径**，已按更宽的输入空间重跑并回填。成因、修法、反向证明见
+> [v2/checklist.md](v2/checklist.md) 末尾「T19 硬伤修复记录」。
 
 > ⚠️ v2 有一处**已知取舍**：Anthropic 开了 extended thinking 就与本阶段的工具不兼容
 > （回灌缺 thinking 签名会被 400），所以「开了 thinking 就不发工具定义」，并在界面明说。
