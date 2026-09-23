@@ -495,7 +495,7 @@ def test_upstream_error_becomes_an_err_event(protocol: str) -> None:
 
 @pytest.mark.parametrize("protocol", ["anthropic", "openai"])
 def test_early_break_still_closes_the_stream(protocol: str) -> None:
-    """N7：调用方提前跳出（用户按 Esc / Ctrl+C）时，流必须被关掉。
+    """N7：调用方提前跳出（取消，或自己 break）时，流必须被关掉。
 
     OpenAI 的 `AsyncStream.close()` 文档写的是「读完才自动调用」——提前 break
     时它**不会**自己关，HTTP 连接就一直挂着。所以适配器必须有 `async with`。

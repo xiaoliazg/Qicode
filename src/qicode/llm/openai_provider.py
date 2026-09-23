@@ -178,8 +178,8 @@ class OpenAIProvider:
             )
             # 这层 async with 不是装饰：AsyncStream.close() 的文档写得很清楚——
             # 「Automatically called **if the response body is read to completion**」，
-            # 也就是**只有把流读完**才自动关连接。用户按 Esc 取消、或中途报错跳出循环时，
-            # 流没读完，就没人关它，HTTP 连接会一直挂着直到 GC。
+            # 也就是**只有把流读完**才自动关连接。中途被取消（用户退出 App）、
+            # 或中途报错跳出循环时，流没读完，就没人关它，HTTP 连接会一直挂着直到 GC。
             # async with 保证任何退出路径（正常、异常、取消）都走到 close()。
             async with stream:
                 async for chunk in stream:
@@ -210,7 +210,7 @@ class OpenAIProvider:
             if buf:
                 yield StreamEvent(tool_calls=_tool_calls_of(buf))
         except asyncio.CancelledError:
-            # 同 anthropic 适配器：打断的取消信号必须原样传出去。
+            # 同 anthropic 适配器：取消信号必须原样传出去（理由见那处的注释）。
             raise
         except Exception as exc:  # noqa: BLE001
             # 同 anthropic 适配器：这里是外部服务的边界，宽catch 是故意的——

@@ -218,8 +218,10 @@ class AnthropicProvider:
                     # 能用的调用，上层拿到半截也无事可做。
                     yield StreamEvent(tool_calls=calls)
         except asyncio.CancelledError:
-            # 用户按 Esc 打断时走这里。必须原样抛出，**不能**吞——
-            # 吞掉的话 asyncio 会认为任务正常跑完了，取消语义就断了。
+            # 取消信号（目前唯一的来源是用户按 Ctrl+C 退出 App）必须原样抛出，
+            # **不能**吞——吞掉的话 asyncio 会认为任务正常跑完了，取消语义就断了。
+            # 别把它跟下面那条宽 catch 合并：`CancelledError` 是 `BaseException`，
+            # 本来也落不进 `except Exception`，这里显式写出来是为了别有人日后顺手改宽。
             raise
         except Exception as exc:  # noqa: BLE001
             # 这一层是**外部服务的边界**：网络断了、密钥不对、被限流、响应格式变了……

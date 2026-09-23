@@ -91,6 +91,9 @@ class QicodeApp(App[None]):
     # 标注成 ClassVar[list[BindingType]] 有两个原因：一是默认规则 RUF012 会把可变的
     # 类属性当隐患报出来，二是 `App.BINDINGS` 本身就是这个类型，照抄能避开
     # 「list 不变型」引发的类型不兼容（BindingType 是 Textual 导出的联合别名）。
+    # 全部按键就这一条：**没有「打断这一轮」的绑定**（Esc 什么也没接），
+    # 本阶段不支持中途取消（`docs/v2/spec.md`「不做的事」）。Ctrl+C 是「退出
+    # Qicode」，退出时顺带取消正在跑的那一轮——两件事别混为一谈（见 `_quit`）。
     BINDINGS: ClassVar[list[BindingType]] = [
         Binding("ctrl+c", "quit", "退出", priority=True, show=False),
     ]
@@ -417,8 +420,14 @@ class QicodeApp(App[None]):
             async for event in Agent(provider, self.tool_registry).run(self.conv):
                 self._on_agent_event(event)
         except asyncio.CancelledError:
-            # 用户按 Esc / Ctrl+C 时走这里。取消靠异常传播，**吞掉就等于把取消吞掉了**
-            # （`agent.Agent.run` 的文档），这里只负责让它继续往上走。
+            # 走到这里只有一条路：`_quit` 里的 `_cancel_stream()`（也就是用户按了
+            # Ctrl+C 要退出）。**没有「打断这一轮」的按键**——Esc 没有绑定，本阶段
+            # 不支持中途取消（`docs/v2/spec.md`「不做的事」）。所以别把这里读成
+            # 「用户想中断当前回复」：他想要的其实是关掉 Qicode。
+            #
+            # 但取消仍然要靠异常传播，**吞掉就等于把取消吞掉了**（`agent.Agent.run`
+            # 的文档），这里只负责让它继续往上走——`_quit` 后面那句 `exit()` 还等着
+            # 一个干净的收尾。
             raise
         except Exception as exc:  # noqa: BLE001
             # agent 内部已经把适配器失败和工具失败都翻成了事件，能到这里的是**我们
