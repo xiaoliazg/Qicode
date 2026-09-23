@@ -22,6 +22,7 @@ from qicode.prompt import (
     MASCOT_BANNER,
     bounce_offset,
     render_banner,
+    system_prompt,
 )
 
 #: 图案占的列数。
@@ -190,3 +191,46 @@ def test_cwd_with_markup_characters_renders_literally() -> None:
     # 顺带把那两种更狠的一起钉上。
     for cwd in ("/tmp/[bold]x", "/tmp/x[/]"):
         Console(file=io.StringIO(), width=200).print(render_banner("0.1.0", cwd))
+
+
+# ────────────────────────── system prompt 的两套措辞（T22） ──────────────────────────
+
+
+def test_prompt_with_tools_tells_the_model_to_use_them() -> None:
+    """有工具时：明确要求「先调用工具，别凭记忆猜」。"""
+    prompt = system_prompt("某接入点", "某模型")
+
+    assert "你可以使用工具" in prompt
+    assert "先调用相应的工具" in prompt
+
+
+def test_prompt_without_tools_forbids_pretending_to_call_them() -> None:
+    """没工具时：不许出现「你可以使用工具」，而且必须点名禁止**假装**调用。
+
+    这条不是措辞洁癖。少了它、又确实没有工具时，模型会照着「有工具」那段的指示去
+    「调用工具」——协议上它调不了，于是就在正文里**演一遍**：写一句
+    `read_file({"path": "a.py"})` 接着编下面的内容。用户看到的是一段像模像样的
+    假输出，比直接说「我读不了文件」危险得多。
+
+    所以这里逐条钉住那三件事：不许说能用、要说清能做的是「开口要」、
+    以及不许写那个形态的假动作。
+    """
+    prompt = system_prompt("某接入点", "某模型", tools=False)
+
+    assert "你可以使用工具" not in prompt
+    assert "没有**可用的工具" in prompt
+    assert "不要**在回复里假装调用工具" in prompt
+    # 点名的那个「假动作长什么样」也必须在——只说「不要假装」模型不知道指的是什么。
+    assert 'read_file({"path": "a.py"})' in prompt
+    # 关掉工具不该把「你是谁、用哪个模型」那段一起弄丢。
+    assert "某接入点" in prompt and "某模型" in prompt
+
+
+def test_prompt_defaults_to_the_tools_version() -> None:
+    """默认是有工具那一版。
+
+    这条守的是**改动方向**：`tools` 是默认 `True` 的关键字参数，Anthropic 那条
+    和一堆老调用点都不传它。哪天谁把默认值改成 `False`，那些路径会集体变成
+    「说明里没有工具、参数里却带着工具」——反过来的同一种错。
+    """
+    assert system_prompt("p", "m") == system_prompt("p", "m", tools=True)

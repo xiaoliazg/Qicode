@@ -777,14 +777,14 @@ def test_thinking_provider_says_tools_are_unavailable(make_config) -> None:
     这是**真**构造一个 `AnthropicProvider`（不开网络，只建客户端）：只有走真路径，
     `supports_tools` 那条「thinking 与工具本阶段互斥」的判断才真的被验到。
     """
-    from qicode.tui.app import TOOLS_UNAVAILABLE
+    from qicode.tui.app import TOOLS_UNAVAILABLE_THINKING
 
     async def scenario(app: QicodeApp, pilot: Pilot) -> None:
         assert app.provider is not None
         assert app.provider.supports_tools is False, (
             "前提不成立：这个接入点居然支持工具"
         )
-        assert TOOLS_UNAVAILABLE in screen_text(app)
+        assert TOOLS_UNAVAILABLE_THINKING in screen_text(app)
 
     with_app([make_config(protocol="anthropic", thinking=True)], scenario)
 
@@ -793,11 +793,11 @@ def test_tools_available_provider_gets_no_hint(make_config) -> None:
     """反过来也要验：工具可用时**不许**出现那一行，不然上面那条可能只是永远显示。"""
 
     async def scenario(app: QicodeApp, pilot: Pilot) -> None:
-        from qicode.tui.app import TOOLS_UNAVAILABLE
+        from qicode.tui.app import TOOLS_UNAVAILABLE_THINKING
 
         assert app.provider is not None
         assert app.provider.supports_tools is True
-        assert TOOLS_UNAVAILABLE not in screen_text(app)
+        assert TOOLS_UNAVAILABLE_THINKING not in screen_text(app)
 
     with_app([make_config(protocol="anthropic", thinking=False)], scenario)
 

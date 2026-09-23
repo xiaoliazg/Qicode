@@ -55,9 +55,23 @@ TICK_INTERVAL = 0.1
 #: `supports_tools` 为假时，在对话区打的那一行提示。
 #:
 #: 必须有这一行：那种接入点压根收不到工具定义，用户让它读文件只会得到一句
-#: 「我做不到」，从界面上完全看不出是配置的原因。原因（本阶段 thinking 与工具
-#: 互斥）见 `docs/v2/plan.md`。
-TOOLS_UNAVAILABLE = "当前配置开启了 thinking，本阶段工具暂不可用"
+#: 「我做不到」，从界面上完全看不出这是 Qicode 这边的限制、还是模型真的没这个能力。
+#:
+#: **分成两句，因为用户下一步该做的事不一样。** 成因有两种，修法完全不搭界：
+#:
+#: - `TOOLS_UNAVAILABLE_THINKING` —— 配置里开着 thinking，**出去改配置**就能用上
+#:   （本阶段 thinking 与工具互斥，见 `docs/v2/plan.md`）。开局就知道，所以一进门就说。
+#: - `TOOLS_UNAVAILABLE_BY_MODEL` —— 模型自己不接受工具定义，**得换个模型**。
+#:   这个开口前问不出来，要撞一次 400 才知道（见 `qicode/llm/openai_provider.py`
+#:   的 `supports_tools`），所以要等这一轮跑完才能说。
+#:
+#: 合成一句「工具暂不可用」就等于把用户丢在原地：他知道坏了，但不知道该动哪儿。
+TOOLS_UNAVAILABLE_THINKING = "当前配置开启了 thinking，本阶段工具暂不可用"
+
+TOOLS_UNAVAILABLE_BY_MODEL = (
+    "这个模型不接受工具定义，已自动降级为纯对话"
+    "（想用工具请换一个支持 function calling 的模型）"
+)
 
 
 class SessionState(Enum):
@@ -212,6 +226,9 @@ class QicodeApp(App[None]):
         self._cur_tool: ToolBlock | None = None
         self._stream_task: asyncio.Task[None] | None = None
         self._timer: Timer | None = None
+        #: 「工具用不了」这件事有没有已经说过。**整个会话只说一次**：成因一旦成立就不会
+        #: 撤销（配置不会自己变，模型能力也不会中途变），每轮都刷一遍只是噪音。
+        self._tools_warned = False
 
     # ────────────────────────── 装配 ──────────────────────────
 
@@ -266,7 +283,7 @@ class QicodeApp(App[None]):
         # `state` 用 init=False 且单 provider 时值没变（本来就是 IDLE），
         # watcher 不会触发，所以这里必须显式同步一次。
         self._sync_chrome()
-        self._warn_if_tools_unavailable()
+        self._warn_if_tools_unavailable(TOOLS_UNAVAILABLE_THINKING)
 
         if self.state is SessionState.IDLE:
             # 必须显式给焦点：Textual 默认把焦点给第一个可聚焦的控件，而对话区
@@ -274,15 +291,28 @@ class QicodeApp(App[None]):
             # 一进来敲字是敲不到输入框里的。
             self.query_one("#input", PromptArea).focus()
 
-    def _warn_if_tools_unavailable(self) -> None:
-        """工具不可用时，在对话区明说一句（`TOOLS_UNAVAILABLE`）。
+    def _warn_if_tools_unavailable(self, notice: str) -> None:
+        """工具不可用时，在对话区明说一句，**整个会话只说一次**。
 
-        两处调用：`on_mount`（单条配置直接进对话）和 `_select_provider`（多条的选完之后）。
+        `notice` 由调用方给：成因不一样，该说的话也不一样（见 `TOOLS_UNAVAILABLE_*`
+        那两条常量的说明）。三个调用点分成两类——
+
+        - `on_mount`（单条配置直接进对话）和 `_select_provider`（多条的选完之后）：
+          这两处说的是「配置里开着 thinking」，**开局就知道**。
+        - `_end_turn`：说的是「模型自己不吃工具定义」，**要撞过一次才知道**。
+
         只看 `on_mount` 是不够的——多配置时那一刻 `self.provider` 还是 None，
-        等用户选完才有值，提示就漏了。
+        等用户选完才有值，提示就漏了，所以选择那一头也得挂一次。
+
+        三个短路条件都是「说了也白说」的情形：已经说过、还没选 provider、
+        以及这个接入点其实收得了工具（绝大多数轮次命中的是最后一条，代价只有读一个属性）。
         """
-        if self.provider is not None and not self.provider.supports_tools:
-            self._append(Text(TOOLS_UNAVAILABLE, style=DIM))
+        if self._tools_warned:
+            return
+        if self.provider is None or self.provider.supports_tools:
+            return
+        self._tools_warned = True
+        self._append(Text(notice, style=DIM))
 
     def watch_state(self, _old: SessionState, _new: SessionState) -> None:
         self._sync_chrome()
@@ -396,7 +426,7 @@ class QicodeApp(App[None]):
         event.stop()
         self.provider = new_provider(pick(self.providers, event.option.id))
         self.state = SessionState.IDLE
-        self._warn_if_tools_unavailable()
+        self._warn_if_tools_unavailable(TOOLS_UNAVAILABLE_THINKING)
         self.query_one("#input", PromptArea).focus()
 
     # ────────────────────────── 提交与流式 ──────────────────────────
@@ -619,6 +649,19 @@ class QicodeApp(App[None]):
         self._cur_tool = None
         self.cur_reply = ""
         self.state = SessionState.IDLE
+
+        # 工具是在**这一轮里**才失效的，要到这儿才知道——那种模型不吃工具定义的接入点
+        # 开口前问不出来，撞过一次 400 才降级（见 `qicode/llm/openai_provider.py`）。
+        #
+        # 放在 `_end_turn` 而不是某个具体收尾函数里，因为这是两条收尾路径（正常答复 /
+        # 出错）**唯一**的汇合点；时机也对：这一轮已经结束，用户正好能把「刚才那句答复
+        # 是在没有工具的情况下给的」和这行提示对上号。
+        #
+        # 传的是「模型不支持」那句。开局就不可用的接入点（配置里开着 thinking）在
+        # `on_mount` / `_select_provider` 已经说过、`_tools_warned` 也置上了，
+        # 走到这儿会直接返回，不会拿着错的那句再来一遍。
+        self._warn_if_tools_unavailable(TOOLS_UNAVAILABLE_BY_MODEL)
+
         # 定型后的 markdown 折行高度可能跟流式正文不一样，有可能**就在这一刻**
         # 才第一次顶出视口。再判一次，免得恰好卡在临界点的那一轮不跟到底。
         self._follow_tail()

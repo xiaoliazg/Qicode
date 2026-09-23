@@ -17,6 +17,7 @@ from collections.abc import AsyncIterator, Sequence
 from types import SimpleNamespace
 from typing import Any, Self
 
+import httpx2
 import openai
 import pytest
 
@@ -35,7 +36,11 @@ from qicode.llm.anthropic_provider import (
     AnthropicProvider,
     _to_anthropic_messages,
 )
-from qicode.llm.openai_provider import OpenAIProvider, _to_sdk_messages
+from qicode.llm.openai_provider import (
+    OpenAIProvider,
+    _rejects_tools,
+    _to_sdk_messages,
+)
 from qicode.prompt import system_prompt
 
 
@@ -692,7 +697,11 @@ def test_anthropic_supports_tools_is_the_inverse_of_thinking(
 
 
 def test_openai_supports_tools_regardless_of_thinking() -> None:
-    """这条链路本来就不发 thinking 参数（v1 的结论），所以工具一直可用。"""
+    """这条链路本来就不发 thinking 参数（v1 的结论），所以 `thinking` 影响不到工具。
+
+    注意这条说的是**开局**的答案。T22 之后它不再是恒真的：模型自己不吃工具定义时，
+    撞过一次就会翻成 False（见下面「运行时降级」那一节）。
+    """
     cfg = make_cfg(protocol="openai", thinking=True)
 
     assert OpenAIProvider(cfg).supports_tools is True
@@ -1047,3 +1056,222 @@ def test_openai_sends_null_content_for_an_empty_preamble() -> None:
     assert sent[0]["content"] is None
     # 顺带把另一处归一钉住：空的 arguments 回灌时必须是 `"{}"`，不能是 `""`。
     assert sent[0]["tool_calls"][0]["function"]["arguments"] == "{}"
+
+
+# ────────── T22：模型不吃工具定义时的运行时降级（ollama 那条 400）──────────
+#
+# 背景：`supports_tools` 在 OpenAI 这条链路上**问不出来**——配置里没有这个字段，
+# 协议也没有查询接口，唯一的办法是带着 `tools` 发一次、看对方怎么答。本地 ollama
+# 上跑 `qwen2.5vl:7b` 时对方每一轮都回 400 `does not support tools`，配了它的
+# Qicode **完全没法用**，而用户看到的只是一句跟他自己做的事毫无关系的英文报错。
+#
+# 修法：撞到就摘掉工具重发一次，并把这件事记在 provider 上（`_tools_rejected`），
+# 之后各轮由 `supports_tools` 说出来、连 agent 都不再要工具。下面这几条钉住这个
+# 行为的四个面：什么时候重试、重试时说哪套话、什么时候**不**重试、两次都失败报哪个。
+
+#: ollama 拒绝工具时回的原话（真机抓的，`str(exc)` 的形状）。
+OLLAMA_NO_TOOLS = (
+    "Error code: 400 - {'error': {'message': "
+    "'registry.ollama.ai/library/qwen2.5vl:7b does not support tools', "
+    "'type': 'invalid_request_error', 'param': None, 'code': None}}"
+)
+
+#: 用例里代表「注册中心那六个工具」的一个定义。
+SOME_TOOL = ToolDefinition(
+    name="read_file", description="读文件", input_schema={"type": "object"}
+)
+
+
+def bad_request(message: str) -> openai.BadRequestError:
+    """造一个 HTTP 400 异常。
+
+    必须用**真的** `openai.BadRequestError`，不能随便拿个 Exception 顶替：适配器那道
+    判断的第一关就是 `isinstance(exc, openai.BadRequestError)`（把 500 之类挡在外面），
+    拿别的类型来测，测的是一个走不到的分支。
+
+    `httpx2` 是 openai 3.x 自己的 HTTP 层——**不是 httpx**（那是 2.x 时代的事），
+    `Response` 只能从它这儿造。
+    """
+    request = httpx2.Request("POST", "https://example.test/v1/chat/completions")
+    response = httpx2.Response(400, request=request)
+    return openai.BadRequestError(message, response=response, body=None)
+
+
+class FakeRetryClient:
+    """`create()` 前几次按剧本抛异常，之后返回正常的流。
+
+    `errors[i]` 是第 i 次调用该抛的异常（`None` = 正常返回流）。跟 `FakeOpenAIClient`
+    最大的不同是：这里把**每一次**调用的参数都留下来（`param_list`）。「重试时到底发没发
+    tools」「一共发了几次请求」正是这批用例要验的东西，只留最后一次就全看不见了。
+    """
+
+    def __init__(
+        self, errors: Sequence[Exception | None], chunks: Sequence[Any]
+    ) -> None:
+        self._errors = list(errors)
+        self._chunks = chunks
+        self.param_list: list[dict[str, Any]] = []
+        self.chat = SimpleNamespace(completions=SimpleNamespace(create=self._create))
+
+    async def _create(self, **params: Any) -> FakeOpenAIStream:
+        index = len(self.param_list)
+        # `messages` 得**当场拷一份**。降级重试时适配器是原地改 `messages[0]` 的
+        # （把 system prompt 换成没有工具的版本），而这个 dict 里存的是**同一个列表
+        # 对象**的引用——不拷的话第一次那份记录会被随后那次改写掉，用例看到两次都是
+        # 新说明，「重试时换了措辞」这条就永远测不出来（第一版正是这么假绿的）。
+        # 真实 SDK 在调用那一刻就把请求体序列化发出去了，本来就不存在这个别名问题。
+        self.param_list.append({**params, "messages": list(params["messages"])})
+        error = self._errors[index] if index < len(self._errors) else None
+        if error is not None:
+            raise error
+        return FakeOpenAIStream(self._chunks)
+
+
+def retrying_provider(
+    errors: Sequence[Exception | None], chunks: Sequence[Any] | None = None
+) -> tuple[OpenAIProvider, FakeRetryClient]:
+    provider = OpenAIProvider(make_cfg(protocol="openai"))
+    fake = FakeRetryClient(errors, chunks if chunks is not None else [chunk("好")])
+    inject(provider, fake)
+    return provider, fake
+
+
+def errors_of(events: Sequence[StreamEvent]) -> list[Exception]:
+    return [ev.err for ev in events if ev.err is not None]
+
+
+def system_message_of(params: dict[str, Any]) -> str:
+    return params["messages"][0]["content"]
+
+
+# ── 什么时候重试 ──
+
+
+def test_a_model_that_rejects_tools_is_retried_without_them() -> None:
+    """撞上「不支持工具」的 400 → 摘掉工具重发一次，而且把它当成一次**成功**。"""
+    provider, fake = retrying_provider([bad_request(OLLAMA_NO_TOOLS)])
+
+    events = asyncio.run(collect(provider, tools=[SOME_TOOL]))
+
+    assert len(fake.param_list) == 2, "没重试"
+    assert fake.param_list[0]["tools"] != openai.omit, "第一次就该带着工具去试"
+    assert fake.param_list[1]["tools"] is openai.omit, "重试时必须把工具摘掉"
+    # 重试成功就是成功：那个 400 不许再冒到界面上——用户什么都没做错。
+    assert errors_of(events) == []
+    assert "".join(ev.text for ev in events) == "好"
+    assert any(ev.done for ev in events)
+    assert provider.supports_tools is False
+
+
+def test_the_retry_tells_the_model_it_has_no_tools() -> None:
+    """重试那一次，system prompt 里「你可以使用工具」必须换成没有工具的版本。
+
+    不换的话第二次请求就成了「说明里写着能用工具、参数里却没有工具」。模型对不上
+    这种矛盾的方式是**编**——写一段 `read_file({"path": "a.py"})` 再接着往下编内容，
+    用户看到一整段像模像样的假输出。这条用例钉的就是这个。
+    """
+    provider, fake = retrying_provider([bad_request(OLLAMA_NO_TOOLS)])
+
+    asyncio.run(collect(provider, tools=[SOME_TOOL]))
+
+    first, second = (system_message_of(p) for p in fake.param_list)
+    assert "你可以使用工具" in first
+    assert "你可以使用工具" not in second
+    assert "没有**可用的工具" in second
+
+
+def test_after_the_retry_the_provider_declares_tools_unsupported() -> None:
+    """降级之后 `supports_tools` 翻成 False，而且**下一轮压根不再撞**。
+
+    两条都要验。只验属性的话，万一下一轮还是带着工具发出去（agent 和适配器各判一次），
+    用户每轮都得白等一个来回——那个 400 是一次真的网络往返。
+    """
+    provider, fake = retrying_provider([bad_request(OLLAMA_NO_TOOLS)])
+    assert provider.supports_tools is True, "前提不成立：一开始应该是可用的"
+
+    asyncio.run(collect(provider, tools=[SOME_TOOL]))
+    assert provider.supports_tools is False
+
+    fake.param_list.clear()
+    asyncio.run(collect(provider, tools=[SOME_TOOL]))
+
+    assert len(fake.param_list) == 1, "第二次还在重试，说明没记住"
+    assert fake.param_list[0]["tools"] is openai.omit
+    assert "你可以使用工具" not in system_message_of(fake.param_list[0])
+
+
+# ── 什么时候**不**重试 ──
+
+
+def test_other_400s_are_not_retried() -> None:
+    """别的 400 一次都不许重试，原样报给用户。
+
+    摘工具重试只对「不支持工具」成立。放宽了的话，一个真正的请求错误（密钥不对、
+    模型名写错）会被摘掉工具重试一次，用户拿到的信息跟原问题隔了一层，
+    还白等一次往返——而那一层是**我们自己加的**。
+    """
+    bogus = bad_request("Error code: 400 - invalid api key")
+    provider, fake = retrying_provider([bogus])
+
+    events = asyncio.run(collect(provider, tools=[SOME_TOOL]))
+
+    assert len(fake.param_list) == 1, "不相干的 400 也重试了"
+    assert errors_of(events) == [bogus]
+    assert provider.supports_tools is True, "不相干的 400 不该把工具判成不可用"
+
+
+@pytest.mark.parametrize(
+    ("message", "expected"),
+    [
+        # ollama 的原话
+        ("registry.ollama.ai/library/qwen2.5vl:7b does not support tools", True),
+        # 语序反过来的一种常见写法
+        ("tool calling is not supported by this model", True),
+        # 缩写、unsupported 两种变体
+        ("this model doesn't support tools", True),
+        ("unsupported tools parameter", True),
+        # 只有一个「tool」，没有否定词
+        ("invalid tool arguments", False),
+        # 否定词和 tool 隔着一个分号，不是同一个小句。`support` 后面那段 `\s+`
+        # 正是卡住它的地方——`supported;` 接不上空白，整条模式就此断掉。
+        ("max_tokens is not supported; invalid tool arguments", False),
+        # **反例：这一句真的会被误判。** 两个词挨得够近，可那句「不支持」说的是
+        # 别的参数，跟工具有什么关系。期望因此是 True——把这个已知的不精确写成用例，
+        # 好过让它留在暗处（见下面「误判的代价」那条注释）。
+        ("the parameter is not supported and the tool argument is wrong", True),
+    ],
+)
+def test_only_the_tools_wording_counts(message: str, expected: bool) -> None:
+    """`_rejects_tools` 认的是「否定词 + support + tool 挨在同一句里」。
+
+    用正则而不是三个词各 `in` 一遍，就是为了要求这三者**挨着**；但这不等于认得出
+    语义，最后一行反例说明它拦不住「碰巧挨着、意思无关」的句子。
+
+    之所以还敢用：这条规则只决定**发不发第二次请求**，不决定要不要把工具永久判死
+    ——那个门槛在「重试成功」那一步（见下一条用例）。所以误判的代价上限是
+    多花一次往返，随后用户看到的是重试那次的真实报错。
+    """
+    assert _rejects_tools(bad_request(message)) is expected
+
+
+# ── 两次都失败时报哪个 ──
+
+
+def test_when_the_retry_also_fails_the_second_error_is_the_one_reported() -> None:
+    """摘掉工具之后仍然失败时，给用户看的是**第二次**那个错。
+
+    因为那才是他此刻真要去解决的问题（密钥、模型名、网络……）。第一次那句
+    「不支持工具」我们已经照办了，再报它只会把人引到一个改不出结果的方向上。
+    """
+    second = bad_request("Error code: 400 - model 'nope' not found")
+    provider, fake = retrying_provider([bad_request(OLLAMA_NO_TOOLS), second])
+
+    events = asyncio.run(collect(provider, tools=[SOME_TOOL]))
+
+    assert len(fake.param_list) == 2
+    assert errors_of(events) == [second], (
+        "报的是第一个错，用户会去改一个已经处理过的问题"
+    )
+    # 重试没成功 = 没拿到「毛病就在工具上」的证据，所以工具**不判死**。
+    # 不这样的话，一个只是碰巧撞上别的问题的接入点从此再也用不上工具了。
+    assert provider.supports_tools is True
