@@ -43,6 +43,18 @@
 > T19 的实跑目录仍是 `/tmp/qicode_e2e`（配置同下表），另造三个夹具：`crlf.txt`
 > （CRLF 三行）、`latin1.txt`（ISO-8859 编码）、`stress/bomb.txt`（80 个 `a` + `!`，
 > 用来触发灾难性回溯）。
+>
+> ---
+>
+> **三次回填：2026-09-23（T20，硬伤修复第二轮）。** 把 T19 那轮审查里**剩下没修完**的
+> 三条做完：一次打断留下孤儿 `tool_use`（之后每轮 400）、`read_file` 撞 FIFO 让进程
+> **永久挂死**、`bash` 输出超限时不说清「是我们杀的」。成因、修法、反向证明见文末
+> 「T20 硬伤修复记录（第二轮）」。
+>
+> 这一轮**没有新增虚勾**——T19 已经把那 5 条按更宽的输入空间重跑过了。T20 修的是
+> 审查清单里当时标了「未修」的那几条，外加一条措辞订正：**AC9 的「一轮工具调用」容易被
+> 读成「一次工具调用」**，已在 `spec.md` 里改成「一轮 = 一次批量」并补上 F6 的准确定义。
+> 实跑目录改在 `/tmp/qc_smoke`（每次用完即删，含密钥的临时配置不放着过夜）。
 
 ## 实现完整性
 
@@ -71,7 +83,7 @@
   **证据 ①：** `test_parse_args_treats_empty_string_as_empty_object`、`test_parse_args_reports_non_object_json`（`不是 json` / `[1, 2]` / `null` / `42` 四组）、`test_anthropic_replay_survives_illegal_tool_input`（历史回放那一侧同样不抛）。
 - [x] 单轮闭环端到端：问「读 X 并总结」→ 模型调用 read_file → 结果回灌 → 给出最终文本总结（验证：`python -m qicode` 跑通，答复体现文件内容）。(AC8/F5/F6)
   **证据 ②：** tmux 实跑「读 docs/v2/spec.md 并用一句话总结」→ `● read_file({"path": "docs/v2/spec.md"})` → `⎿ 1…# v2 工具系统 Spec …` + `… 还有 102 行` → 最终答复准确概括了 spec 内容（统一工具抽象 + 注册中心 + 六个核心工具 + 两协议流式解析 + 单轮闭环）。
-- [x] 单轮上限：需连续两步工具的任务，第一轮工具后即停、不发起第二轮工具执行（验证：`tests/test_agent.py` 脚本 (b) 断言只调用一次 `registry.execute`；或端到端观察）。(AC9/F6)
+- [x] 单轮上限：**一轮 = 一次批量**——同一次请求里的多个工具调用**全部执行**，但结果回灌之后**不再发起第二轮**（验证：`tests/test_agent.py` 的 `test_second_request_asking_for_tools_is_ignored` 断言请求#2 又要工具时不再触发执行；端到端见场景 4）。(AC9/F6)
   **证据 ③：** ① `test_second_request_asking_for_tools_is_ignored`（请求#2 又要工具时不执行）、`test_tool_limit_gets_its_own_message`；② tmux 实跑「新建 out/hello.txt 再 bash 查看」——模型把两步拆到两次请求，第二轮又要工具时被拦下，对话区出现 `● 模型还想继续调用工具，但一轮只执行一次。请再发一条消息让它接着做。`，再发一条「继续」后它才跑 bash。**没有**自动发起第二轮工具执行。
 - [x] `supports_tools` 生效：anthropic 配置开 `thinking: true` 时，请求体**不带** `tools`，且对话区有一行说明；openai 侧恒为 `True`（验证：`tests/test_agent.py` 脚本 (c) + 单测断言 `AnthropicProvider(cfg_thinking_true).supports_tools is False`）。(plan「关于 thinking 与工具的冲突」)
   **证据 ③：** ① `test_anthropic_supports_tools_is_the_inverse_of_thinking[False-True]` / `[True-False]`、`test_openai_supports_tools_regardless_of_thinking`、`test_anthropic_omits_tools_when_none_given`、`test_anthropic_sends_tools_with_input_schema`、`test_tools_are_withheld_when_the_provider_says_so`；② 另起一个 `/tmp/qicode_think` 配置（`thinking: true`）真终端启动 → 对话区顶部出现 `当前配置开启了 thinking，本阶段工具暂不可用`，纯文本对话仍正常（`说一句你好` → `你好`）。
@@ -121,11 +133,12 @@
   **证据：** `36 files already formatted`
 - [x] `pytest -v` 通过（`tests/test_tool.py`、`tests/test_agent.py` 新建并全绿；`test_tui_stream.py` 已随 `stream.py` 删除）。
   **证据：** `pytest -q` → **233 passed**。按文件分：`tests/test_tool.py` 45 条、`tests/test_llm_providers.py` 49 条、`tests/test_tui_app.py` 35 条、`tests/test_tui_view.py` 18 条（T17 新建）、`tests/test_agent.py` 17 条，全部通过。
-  **T19 复核（数字更新）：** `pytest -q` → **249 passed**。按文件分：`test_tool.py` **55**、`test_llm_providers.py` **50**、`test_tui_app.py` 35、`test_tui_view.py` **19**、`test_agent.py` **21**、`test_config.py` 30、`test_conversation.py` 9、`test_prompt.py` 9、`test_redact.py` 8、`test_tui_select.py` 7、`test_cli.py` 6。
-    **233 → 249 的 +16 拆得开**：T19 这轮加 **10** 条（全在 `test_tool.py`，覆盖三个硬伤）；另外 **6** 条是 T18 之后「工具行中文转义」那次提交（`69112b7`）加的——`test_agent.py` +4、`test_llm_providers.py` +1、`test_tui_view.py` +1，该提交信息里记的就是 **239 passed**（233 + 6）。
+  **T20 复核（数字更新）：** `pytest -q` → **264 passed**。按文件分：`test_tool.py` **69**、`test_llm_providers.py` **50**、`test_tui_app.py` 35、`test_config.py` 30、`test_agent.py` **22**、`test_tui_view.py` **19**、`test_conversation.py` 9、`test_prompt.py` 9、`test_redact.py` 8、`test_tui_select.py` 7、`test_cli.py` 6。
+    **249 → 264 的 +15 拆得开**：② 加 **11** 条（`test_tool.py`：非普通文件拦截 6 条 + `_run_blocking` 原语 4 条 + 目录文案不回归 1 条）、③ 加 **3** 条（`test_tool.py`：超限说明在场 / 不误报 / 位置在正文前部）、① 加 **1** 条（`test_agent.py`：半截工具回合保留已拿到的真结果）。`test_tool.py` 55 → 69、`test_agent.py` 21 → 22，其余文件一条未动。
 - [x] `mypy src/qicode/` 通过。
   **证据：** `Success: no issues found in 22 source files`
   **T19 复核：** 上面四条（`ruff check .` / `ruff format --check .` / `pytest -q` / `mypy src/qicode/`）在三个硬伤修完后全部重跑，除了 `pytest` 的条数，输出逐字未变（`All checks passed!` / `36 files already formatted` / `Success: no issues found in 22 source files`）。
+  **T20 复核：** T20 三条修完后同样重跑四条，输出**逐字仍未变**（同上三句），`pytest -q` → **264 passed**（见上一行的分文件数字）。② 用到的 `_run_blocking` 是新的执行原语，`mypy` 仍需 22 个源文件全过——PEP 695 泛型参数写法在这版 mypy 下无告警。
 - [x] 异步测试**没有**引入 `pytest-asyncio`（验证：`grep -n "pytest-asyncio\|asyncio_mode" pyproject.toml` 无输出，新测试全用 `asyncio.run`）。(plan 技术决策「异步测试怎么写」)
   **证据 ①：** `grep` 无输出；`tests/test_agent.py` 与非流式的 provider 用例全部是同步 `def test_...` 里包一个 `asyncio.run(...)`。
 - [x] 密钥不回显/不打印：对话区与任何输出均不出现 `api_key`；工具执行结果里也不带（验证：通读运行输出、检索无明文 key）。(N6)
@@ -156,6 +169,27 @@
   完整支持留待后续阶段。
 - **并发工具执行**：本阶段顺序执行，不做并发加速（spec「不做的事」）。
 - **权限确认**：写文件与执行命令不做授权确认（spec「不做的事」）。
+- **中断键**：没有「打断这一轮」的按键——`App.BINDINGS` 里只有 `ctrl+c → 退出`，
+  Esc 什么也没接（spec「不做的事」：不支持中途取消）。Ctrl+C 是退出整个程序，
+  退出前会 `_cancel_stream()`，所以取消路径仍然被走到，但那不等于中断。
+  **注意**：一旦加上中断键，`docs/v2/checklist.md`「硬伤 4」那条潜伏缺陷就变成活的
+  ——那条已经修好了，这里只是记一笔因果。
+
+## 留给下一阶段（T19/T20 审查提出、本轮明确不做）
+
+下面两条是 T19 那轮三层代码审查提出来的，都**不是缺陷**，是范围/产品的取舍。
+居居在 2026-09-23 定了：**不在 v2 修**，随权限阶段一起做。记在这里，免得它们
+只活在对话里。
+
+- **脱敏范围（redact scope）**：`qicode.redact` 目前只有**一个**调用点——
+  `tui/app.py:560`，洗的是上游异常原文。工具**读出来的文件内容**、`bash` 的输出，
+  上屏 / 进历史 / `/exit` 回放**全是原文**。
+  之所以不顺手扩：全量脱敏要靠模式匹配（`sk-…`、`AKIA…` 之类），就会有误报，
+  把用户正常讨论的字符串也抹掉。**边界怎么划是产品决定**，且它跟权限是一件事
+  （「谁的密钥能在什么范围内出现」），所以放到权限阶段一起定。
+- **超长单行的渲染上限**：`view.py` 对一行内容的渲染长度没有上限。
+  实测 100 万字符单行 → **58ms**，是**卡顿**不是冻死（Textual 自己会 wrap）。
+  加不加渲染上限、加多少，是体验取舍，本阶段不动。
 
 ## 跨协议 A/B（T18 补做）
 
@@ -267,3 +301,102 @@ v2 交付后做了一次三层代码审查（工具层 / 适配器层 / TUI 层�
 打勾时挑的输入**恰好绕开了**缺陷所在的那片空间（单命令 vs 管道、ASCII+LF vs CRLF+非
 UTF-8、普通关键字 vs 恶意正则）。写验收证据时值得专门问一句：**「我挑这个输入，是因为
 它有代表性，还是因为它跑得通？」**
+
+## T20 硬伤修复记录（第二轮）（2026-09-23）
+
+T19 之后，把同一轮三层审查里**剩下没修完**的几条做完。判据和 T19 一样：只收「会挂死
+进程、会废掉整场对话」那一类，风格问题不在这轮的范围内。数字同样都是实跑出来的，
+反向证明的做法也一样（撤掉修复逻辑，确认用例确实失败）。
+
+### 硬伤 4 · 一次打断留下孤儿 `tool_use`，此后每轮都撞 400
+
+- **症状**：模型说「我调 read_file」之后、工具结果写进历史之前，这一轮被取消——这条
+  **残废的历史留在会话里**，之后不管发什么，服务端都以 400 拒绝。
+- **今天打不打得出来（诚实交代）**：**打不出来。** 本阶段 `App.BINDINGS` 里只有
+  `ctrl+c → 退出`，取消只发生在 `_quit` 的 `_cancel_stream()` 里，而紧接着就是
+  `exit()`——会话本来就没了，「之后每轮都 400」没有之后。所以这一条是**潜伏的**，
+  不是线上能复现的。
+  它仍然算硬伤，有两个理由：一是 `Agent.run` 是对外可复用的一层，任何调用方
+  `cancel()` 都会踩到这段路径；二是「给 Qicode 加个中断键」是明显的下一步（本轮
+  ④⑤⑥ 里的 ⑤ 就是它），**中断键一加上，这条立刻从潜伏变成每天都会中**。修的代价
+  是 8 行，不修的代价是「加中断键那天炸」。
+- **根因**：Anthropic 协议要求每个 `tool_use` 块在**紧邻的下一条**消息里有配对的
+  `tool_result`。取消发生的那一刻，assistant 那条（带 `tool_use`）已经入历史了，而
+  tool 那条还没写——历史停在「有 use、没有 result」的形状上。**而且是黏的**：这段历史
+  是会话的一部分，每轮都原样发出去，于是每轮都 400。实测 400 原文：
+  `'tool_use' ids were found without 'tool_result' blocks immediately after`。
+- **修法**：取消时**把这一轮补完整**再 `raise`——已经跑完的工具保留**真结果**，还没轮到的
+  补一条「用户取消了这次工具调用，没有执行结果」（`CANCELLED_RESULT`）。
+  **为什么不干脆撤掉那条 assistant 回合**：撤掉的话模型完全不知道刚才调过工具，下一轮
+  会从头再来一遍；补一条说明更诚实，而且对「前几个跑完了、后几个没轮到」这种半截状态
+  天然成立。
+- **反向证明**：撤掉补齐逻辑（等价旧行为）→ 两条用例断言失败
+  （`['user','assistant']` vs 期望的 `['user','assistant','tool']`）；装回去即过。
+  **注意这个证明的层级**：用例是**直接 `cancel()` 那个 task** 的，证的是「取消走到这里
+  时历史是完整的」，不是「用户能按出这个取消」——后者本阶段不存在。
+
+### 硬伤 5 · `read_file` 撞上 FIFO，进程永久挂死
+
+- **症状**：`read_file` 读一个**没有写端**的命名管道，工具在 2 秒时如实报了「超时」，
+  `main()` 也确实返回了——**然后进程就再也不动了**，只能 `kill -9`（退出码 137）。
+- **根因**：两件事叠在一起。
+  1. `open()` 在没有写端的 FIFO 上**永久阻塞**，这是内核行为，不是我们的 bug。
+  2. 更要紧的是**「超时生效」和「进程能退出」是两件事**。超时取消的只是那个 `await`，
+     线程还在跑。而 `asyncio.run()` 收尾时会调 `loop.shutdown_default_executor()`——
+     它把默认线程池里**每一个线程**都 join 掉。一个我们早已放弃的阻塞调用，就这样扣住了
+     整个进程。实测的形状很说明问题：`[2.00s] wait_for 到点抛 TimeoutError`、
+     `[2.00s] main() 即将 return`（都打出来了），然后**没有任何后续输出**。
+- **修法**：分两层，`(a)` 治已知的几种、`(b)` 治这一整类。
+  - **(a) 门口拦下**：开读前先 `stat` 看 inode 类型，非普通文件（FIFO / 套接字 / 字符设备 /
+    块设备）直接拒绝并说明是什么。三个文件工具（读 / 写 / 改）统一走
+    `tool._refuse_if_special`。做法本身也**必须在线程里**：`stat()` 自己碰上网盘挂死
+    一样会阻塞，放事件循环上等于把刚绕开的坑换个地方挖。
+  - **(b) 换掉线程池**：`asyncio.to_thread` → 自建的 **守护线程** 原语 `_run_blocking`
+    （`loop.call_soon_threadsafe` 回填 Future）。守护线程被 `threading._shutdown()` 跳过，
+    `asyncio.run()` 也不等它——**进程想退就退**。代价说在明处：被放弃的线程**泄漏一个**，
+    这是拿「漏一个线程」换「进程关不掉」。4 处调用（`read_file` 1、`write_file` 1、
+    `edit_file` 2）全部换掉——只换 `read_file` 的话，往挂死的网络盘**写**照样能扣住进程。
+- **成效**：FIFO / `/dev/zero` / `/dev/random` 一律 **0.00 秒**返回结构化错误，进程退出码
+  **0**。对照组未回归：目录仍报「是一个目录，不是文件」、普通文件照常读、**新建**
+  不存在的文件照常、**软链到普通文件**照常（`stat` 跟链接）。
+- **反向证明**：
+  - 撤掉层 (a) → FIFO 用例**把整个 pytest 挂死**（外层 25 秒硬超时 → 退出码 **137**，
+    连 pytest 的收集信息都没输出）；字符设备用例断言失败，旧行为下它**真的读回了 256KB
+    的 `\x00`**，还返回 `is_error=False`。
+  - 撤掉层 (b) 的性质（`daemon=True` → `False`）→ 守护线程用例失败。
+  - 另做了一组 A/B，同一个「永不返回的阻塞调用」：`to_thread` 侧 2.00 秒超时→`main()` 返回
+    →**再无输出**→退出码 **137**；`_run_blocking` 侧前缀**逐字相同**，差别只在最后一步
+    ——`asyncio.run` 正常返回，退出码 **0**。
+
+### 硬伤 6 · `bash` 输出超限时，没人告诉模型是谁杀的
+
+- **症状**：跑一条输出超过 256KB 的命令，模型只看得到 `exit_code: -9`——一个它没发过的
+  信号退出码，正文里**没有一个字**解释。
+- **根因**：`slurp` 读满 `_MAX_PIPE_BYTES` 就 `_kill_tree`（这本身是必须的：不杀的话
+  管道缓冲区填满，子进程阻塞在写 stdout 上，整个工具卡死到超时）。但「我们发过 SIGKILL」
+  这个事实**只存在于我们的代码里**，没往结果正文里写。模型于是只能猜命令为什么崩，
+  然后去改命令的**逻辑**——而该改的是命令的**范围**。
+- **修法**：`slurp` 多返回一个「是不是读满上限才停的」，正文里据此加一段说明，写清三件事
+  ——**谁干的**（我们发的 SIGKILL）、**为什么**、**接着怎么办**（缩小范围，如加 `| head -100`）。
+  位置排在 `exit_code` **紧后面**：`_truncate` 是**从尾部**切的（`text[:max_chars]`），
+  写在前面的东西无论输出多长都不会被截掉，而这条说明恰恰是最需要在场的那种。
+  另外在工具的 `description()` 里也补了一句。
+- **反向证明**：关掉这段说明重跑新用例 → 断言失败，旧行为下正文就是光秃秃的
+  `exit_code: -9\nstdout:\ny\ny\ny…`。
+- **意外收获**：真机跑的时候，模型**读了 `description()` 那句，事前就绕开了**——它把
+  `yes` 主动改成 `yes | head -5`，并解释「直接裸跑会被工具在 256KB 处截断，没有意义」。
+  强迫它原样跑之后，它拿到提示又正确区分了**两层截断**（256KB 的读取上限 vs 30000 字符的
+  展示上限）：「结尾的 `[truncated]` 是另一层截断，具体截到多少我说不准」。
+  **写进描述里的护栏，比写在错误里的护栏早一步生效。**
+
+### 这一轮真正学到的东西
+
+**「超时生效了」不等于「进程能退出了」。** 这是硬伤 5 的全部教训。超时能取消 `await`，
+但取消不了一个正在阻塞的线程；而进程收尾时会去 join 那些线程。判断一个「卡住的调用」
+有没有真的被解决，要看的不是 `wait_for` 抛没抛 `TimeoutError`，而是**进程最后退没退出去**。
+这和 T19 那条（「丢线程/加超时对同步 C 调用无效」）是一对：那条说的是**线程抢不到 GIL**，
+这条说的是**线程根本没人管得住**。
+
+**另一条**：护栏可以写在**事前**，也可以写在**事后**。硬伤 6 原本只打算补事后说明，
+顺手在 `description()` 里加了一句，结果真机上模型**先读了描述**、直接绕开了那条路。
+工具描述是模型唯一的「使用说明书」，值得当成产品界面来写。

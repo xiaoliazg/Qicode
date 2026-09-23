@@ -396,6 +396,39 @@
 **验证：** 三个硬伤在真终端复现不再出现、反向证明成立、`ruff check .` /
 `ruff format --check .` / `pytest`（**249 passed**）/ `mypy src/qicode/` 全绿。
 
+## T20: 交付后硬伤修复（第二轮）
+
+**文件：** `src/qicode/agent/__init__.py`、`src/qicode/tool/{__init__,read_file,write_file,edit_file,bash}.py`、
+`tests/test_agent.py`、`tests/test_tool.py`、`docs/v2/{spec,checklist}.md`
+**依赖：** T19
+**背景：** T19 那轮三层审查还剩几条没修完的。这一轮把它们做完——同样是「会挂死进程 /
+一次打断就能废掉整场对话」那一类，不是风格问题。成因、修法、反向证明见
+`docs/v2/checklist.md` 末尾「T20 硬伤修复记录（第二轮）」。
+
+**步骤：**
+1. 取消打断留下**孤儿 `tool_use`** → 打断时把工具回合**补完整**再抛：已经跑完的用真结果，
+   没轮到的补一条「用户取消了这次工具调用」。不补的话历史停在「有 `tool_use`、没有
+   `tool_result`」的形状上，Anthropic 以 400 拒绝，而且这段历史**留在会话里**——之后
+   每一轮都撞同一个 400。（本阶段没有中断键，取消只在 Ctrl+C 退出时发生，所以这是潜伏
+   缺陷——见 `docs/v2/checklist.md`「硬伤 4」里的交代。）
+2. `read_file` 撞上 FIFO **进程永久挂死** → 分两层：
+   (a) 开读前 `stat` 看 inode 类型，非普通文件直接拒绝（`read_file` / `write_file` /
+   `edit_file` 三个统一，公共件放 `tool/__init__.py`）；
+   (b) 把 `asyncio.to_thread` 换成**守护线程**原语 `_run_blocking`（4 处调用全换）。
+   根因是 `asyncio.run()` 收尾要 join 默认线程池，一个我们早已放弃的阻塞调用就能让
+   Qicode **关不掉**。层 (a) 治已知的几种，层 (b) 治这一整类。
+3. `bash` 输出超限时只有一句 `exit_code: -9`，**没说是我们杀的** → 正文里写清「是我们发的
+   SIGKILL、为什么、接着怎么办」，位置排在 `exit_code` **紧后面**（`_truncate` 从尾部切，
+   写前面才留得住）；工具的 `description()` 也补一句，让模型**事前**就知道有这条线。
+4. 每条都要有**反向证明**：撤掉修复逻辑重跑新用例，确认它确实失败——否则无法排除
+   「这个用例本来就过」。注意 ② 的两条反向证明会让整个 pytest **挂死**，得在外层套硬超时
+   抓退出码 137。
+5. 重跑四道门禁；在真终端（tmux）复跑三个文件工具与 `bash` 超限路径。
+6. 顺手把 AC9 的措辞改准：**「一轮」= 一次批量**，不是一次调用（原话容易被读成后者）。
+
+**验证：** 三个缺陷在真终端不再出现、反向证明成立、`ruff check .` /
+`ruff format --check .` / `pytest`（**264 passed**）/ `mypy src/qicode/` 全绿。
+
 ## 执行顺序
 
 ```
@@ -409,6 +442,6 @@ T1 ─┬─ T2 ─┬─ T3 ─┐
     │        └─ T12 ─────┤
     ├─ T13 ──────────────┤
     └─ T15               │
-                T9,T11,T12,T13 ─→ T14 ─→ T16 ─→ T17 ─→ T18 ─→ T19
+                T9,T11,T12,T13 ─→ T14 ─→ T16 ─→ T17 ─→ T18 ─→ T19 ─→ T20
                                    T15 ──┘
 ```

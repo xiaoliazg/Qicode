@@ -10,7 +10,11 @@
 
 import asyncio
 import json
+import stat
+import threading
+from collections.abc import Callable
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
 
 from qicode.llm import ToolDefinition
@@ -117,6 +121,120 @@ class Registry:
             return Result(f"工具 {name} 执行超时（{timeout:g} 秒）", is_error=True)
         except Exception as exc:  # noqa: BLE001 —— 这里要的就是「什么都接住」
             return Result(f"工具 {name} 执行出错: {exc}", is_error=True)
+
+
+async def _run_blocking[T](fn: Callable[..., T], /, *args: Any) -> T:
+    """把同步的阻塞调用丢进**守护线程**执行，结果回填给事件循环。
+
+    **为什么不用 `asyncio.to_thread`**：它跑在默认线程池里，而 `asyncio.run()` 收尾时会
+    调 `loop.shutdown_default_executor()`——那个方法会把池里**每一个**线程 join 掉。
+    于是一个永远不会结束的阻塞调用（读一个没写端的 FIFO、读挂死的网络盘）就能把
+    **整个进程**扣住，连界面都关不掉。实测过的形状：工具在 2 秒时如实报了超时、
+    `main()` 也返回了，进程却从此不动，只能 `kill -9`。
+
+    这不是「超时没生效」，而是超时**只管住了 await，管不住那个线程**。守护线程换来的
+    是：`threading._shutdown()` 会跳过它，`asyncio.run()` 也不等它——**进程想退就退**。
+
+    代价说在明处：被放弃的线程**会泄漏一个**，它继续阻塞，只是没人等它的结果了。
+    这是刻意的取舍——「漏一个线程」比「进程关不掉」轻得多。各工具在调用前还会先做
+    廉价的前置检查（如 `read_file` 拒收非普通文件），把最常见的成因掐在进入线程之前。
+
+    回填时先查 `fut.done()`：超时那条路上 `wait_for` 已经把 Future 取消了，迟到几秒
+    的结果直接丢掉即可——不查的话 `set_result` 会抛 `InvalidStateError`。
+    事件循环已经关掉时 `call_soon_threadsafe` 抛 `RuntimeError`，同样吞掉——那一刻
+    进程正在退出，这条结果本来也没人要了。
+    """
+    loop = asyncio.get_running_loop()
+    fut: asyncio.Future[T] = loop.create_future()
+
+    def work() -> None:
+        # 连 `BaseException` 一起接住：漏掉任何一种，这个 Future 就永远不 resolve，
+        # 那边 `await` 的调用方会跟着一起挂死——比原样抛出更难查。
+        try:
+            payload: tuple[bool, Any] = (True, fn(*args))
+        except BaseException as exc:  # noqa: BLE001 —— 见上
+            payload = (False, exc)
+
+        def deliver() -> None:
+            if fut.done():
+                return
+            ok, value = payload
+            if ok:
+                fut.set_result(value)
+            else:
+                fut.set_exception(value)
+
+        try:
+            loop.call_soon_threadsafe(deliver)
+        except RuntimeError:
+            # 事件循环已关闭（进程正在收尾）。没有等待者了，丢掉。
+            pass
+
+    threading.Thread(
+        target=work,
+        name=f"qicode-blocking:{getattr(fn, '__name__', 'callable')}",
+        daemon=True,
+    ).start()
+    return await fut
+
+
+class _NotRegularFile(Exception):
+    """路径存在，但不是普通文件——管道、设备、套接字。
+
+    单独一个异常类型而不是复用 `OSError`：这几种路径 `open()` 未必报错（FIFO 会**阻塞**，
+    字符设备会乖乖打开然后吐数据），所以它不是「打开失败」，而是「我们压根不打算打开」。
+    `reason` 是给模型看的那半句话。
+    """
+
+    def __init__(self, reason: str) -> None:
+        super().__init__(reason)
+        self.reason = reason
+
+
+def _special_reason(mode: int) -> str | None:
+    """inode 是管道 / 设备 / 套接字就说一句人话，否则回 `None`。
+
+    **目录故意回 `None`**：它对三个工具的含义各不相同（读它是「不是文件」、写它是
+    「不能往目录里写」），文案得各写各的，所以这里不抢那句话——放行让 `open()` /
+    `write_text()` 抛它们原本那个 `IsADirectoryError`，各工具有各自的接法。
+
+    `S_ISSOCK` 也值一提：套接字文件上用 `open()` 本来就抛 `ENXIO`，但那时只能说一句
+    「读取失败」，不如这里直接点破它是什么。
+    """
+    if stat.S_ISFIFO(mode):
+        return "是一个命名管道（FIFO）"
+    if stat.S_ISSOCK(mode):
+        return "是一个 Unix 套接字"
+    if stat.S_ISCHR(mode):
+        return "是一个字符设备"
+    if stat.S_ISBLK(mode):
+        return "是一个块设备"
+    return None
+
+
+def _refuse_if_special(target: Path) -> None:
+    """目标的 inode 若是管道 / 设备 / 套接字，抛 `_NotRegularFile`；其余一律放行。
+
+    三个文件工具在读/写**之前**都先过这一道。拦在门口而不是放行让 IO 去碰运气，
+    是因为这几种路径的失败方式都不体面：没有写端的 FIFO 上 `open()` **永久阻塞**
+    （实测：工具如实报了超时，进程却再也退不出去，只能 `kill -9`）；`/dev/zero` 会
+    一直吐零；`/dev/random` 收不住。而「读一个文件的内容」这件事，在管道和设备上
+    根本没有定义——读出来是什么取决于另一端有没有人在写。
+
+    **这一步必须在线程里做**：`stat()` 自己碰上网盘挂死一样会阻塞，放事件循环上等于
+    把刚绕开的坑换个地方挖。三个调用方都是在各自的同步函数里调它的。
+
+    **不存在不算问题**，直接放过：三个调用方对「文件不存在」各有各的说法——写是
+    「待创建」，读和改是「文件不存在」——都轮不到这里插嘴，交给它们原本那条路径去报。
+    stat 的其它失败（权限不够、路径中段不是目录）同理。
+    """
+    try:
+        mode = target.stat().st_mode
+    except OSError:
+        return
+    reason = _special_reason(mode)
+    if reason is not None:
+        raise _NotRegularFile(reason)
 
 
 def _truncate(text: str, max_lines: int, max_chars: int) -> str:

@@ -11,6 +11,7 @@
 一处读，边界才干净。
 """
 
+import asyncio
 import json
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
@@ -39,6 +40,38 @@ EMPTY_REPLY = "模型返回了空回复"
 #: 而这里它明明说了——它想接着调工具，只是本阶段一轮只给一次。用错的那句会让用户
 #: 以为模型抽风了，实际上是我们主动停的手，得让他知道「再发一条就能继续」。
 TOOL_LIMIT = "模型还想继续调用工具，但一轮只执行一次。请再发一条消息让它接着做。"
+
+#: 这一轮被取消时，**没轮到执行**的那些工具调用补进历史的结果。
+#:
+#: 为什么宁可编一条也要补（理由见 `_complete_tool_round`）：Anthropic 协议要求每个
+#: `tool_use` 块在紧邻的下一条消息里有配对的 `tool_result`，少一个就是 400——而且
+#: 这段历史**留在会话里**，之后每一轮都撞同一个 400，一次取消就能废掉整场对话。
+#:
+#: 本阶段**没有中断键**（取消只在 Ctrl+C 退出时发生，见 `Agent.run` 的文档），
+#: 所以这今天打不出来：退出之后会话本来就没了。它是留给「以后加中断键」和
+#: 「`Agent.run` 被别的调用方 `cancel()`」的——那两种情况走的是同一段代码。
+CANCELLED_RESULT = "用户取消了这次工具调用，没有执行结果。"
+
+
+def _complete_tool_round(
+    calls: list[ToolCall], done: list[ToolResult]
+) -> list[ToolResult]:
+    """把一批工具调用补成**齐全**的结果列表，交给 `Conversation.add_tool_results`。
+
+    正常跑完时 `done` 已经和 `calls` 一一对应，这里原样返回；**被取消**时 `done`
+    只有前半截，缺的那些用 `CANCELLED_RESULT` 顶上。
+
+    为什么不干脆把那条 assistant 回合撤掉：撤掉的话模型完全不知道刚才调过工具，
+    下一轮会从头再来一遍。补一条说明更诚实，而且对「前几个跑完了、后几个没轮到」
+    这种半截状态天然成立——已经执行的**真结果**会照常保留。
+    """
+    by_id = {r.tool_call_id: r for r in done}
+    return [
+        by_id[c.id]
+        if c.id in by_id
+        else ToolResult(tool_call_id=c.id, content=CANCELLED_RESULT, is_error=True)
+        for c in calls
+    ]
 
 
 class Phase(Enum):
@@ -162,9 +195,15 @@ class Agent:
         事件的到达顺序**就是**渲染顺序：正文增量 → （工具 START → 工具 END）× N →
         最终正文增量 → done。界面因此不用自己判断「现在该画哪一块」。
 
-        调用方 `cancel()` 掉跑这个生成器的 task 即可打断（用户按 Esc / Ctrl+C）：
-        `async for` 会把 `CancelledError` 原样抛上来，适配器那边的 `async with`
-        顺势关掉 HTTP 流。工具执行本身受 `DEFAULT_TIMEOUT` 约束（N1）。
+        调用方 `cancel()` 掉跑这个生成器的 task 即可打断：`async for` 会把
+        `CancelledError` 原样抛上来，适配器那边的 `async with` 顺势关掉 HTTP 流。
+        工具执行本身受 `DEFAULT_TIMEOUT` 约束（N1）。
+
+        **但「打断」目前没有按键**：`App.BINDINGS` 里只有 `ctrl+c → 退出`，
+        退出前会 `_cancel_stream()`——所以这条取消路径真的会被走到，只不过触发它的是
+        「关掉 Qicode」而不是「打断这一轮」；Esc 压根没有绑定。本阶段不支持中途取消
+        （`docs/v2/spec.md`「不做的事」）。这条路径仍然要写对：以后给上中断键、
+        或者被别的调用方 `cancel()`，走的就是同一段代码。
         """
         # 工具定义只在这里取一次。`supports_tools` 为假（Anthropic 开了 thinking）
         # 时就给空列表——界面那边看的是**同一个**属性，所以「工具暂不可用」的提示
@@ -196,33 +235,54 @@ class Agent:
         conv.add_assistant_with_tool_calls(first.text, first.calls)
 
         results: list[ToolResult] = []
-        for call in first.calls:
-            preview = preview_args(call.input)
-            yield Event(tool=ToolEvent(name=call.name, args=preview, phase=Phase.START))
-
-            # 传 `call.input` 原文而不是 preview：预览是给眼睛看的，执行要完整的。
-            # `Registry.execute` 把所有失败（未知工具 / 超时 / 工具自己抛异常）
-            # 都收成结构化 `Result`，所以这里不会抛——这正是 N4 要的形状。
-            result = await self._registry.execute(
-                call.name, call.input, DEFAULT_TIMEOUT
-            )
-
-            yield Event(
-                tool=ToolEvent(
-                    name=call.name,
-                    args=preview,
-                    phase=Phase.END,
-                    result=result.content,
-                    is_error=result.is_error,
+        try:
+            for call in first.calls:
+                preview = preview_args(call.input)
+                yield Event(
+                    tool=ToolEvent(name=call.name, args=preview, phase=Phase.START)
                 )
-            )
-            results.append(
-                ToolResult(
-                    tool_call_id=call.id,
-                    content=result.content,
-                    is_error=result.is_error,
+
+                # 传 `call.input` 原文而不是 preview：预览是给眼睛看的，执行要完整的。
+                # `Registry.execute` 把所有失败（未知工具 / 超时 / 工具自己抛异常）
+                # 都收成结构化 `Result`，所以这里不会抛——这正是 N4 要的形状。
+                result = await self._registry.execute(
+                    call.name, call.input, DEFAULT_TIMEOUT
                 )
-            )
+
+                yield Event(
+                    tool=ToolEvent(
+                        name=call.name,
+                        args=preview,
+                        phase=Phase.END,
+                        result=result.content,
+                        is_error=result.is_error,
+                    )
+                )
+                results.append(
+                    ToolResult(
+                        tool_call_id=call.id,
+                        content=result.content,
+                        is_error=result.is_error,
+                    )
+                )
+        except asyncio.CancelledError:
+            # 取消在这里到达（**来源见 `run` 的文档**：目前只有「用户按 Ctrl+C 退出」
+            # 这一条，没有中断键）——但这是取消最难看的一种时机：上面那条 assistant
+            # 回合已经带着 `tool_use` 块入过历史了，而工具结果还没写。
+            #
+            # **必须把历史补完整再抛出去。** 直接抛的话历史就停在「有 `tool_use`、
+            # 没有 `tool_result`」的形状上，Anthropic 会以
+            # `'tool_use' ids were found without 'tool_result' blocks immediately
+            # after` 返回 400——而且这段历史**留在会话里**，之后每一轮都撞同一个 400。
+            #
+            # 今天这条 400 打不出来（取消总伴随退出，会话随之消失），但 `Agent.run`
+            # 是任何调用方都能 `cancel()` 的一层，而「加个中断键」就是下一步——
+            # 那时它从潜伏变活。补几句的代价和那天炸一次完全不对等。
+            #
+            # 补完照旧 `raise`：取消语义必须传上去，调用方（`_cancel_stream` 之后的
+            # `exit()`）等的是一个干净的收尾，不是一条被吞掉的异常。
+            conv.add_tool_results(_complete_tool_round(first.calls, results))
+            raise
 
         # 一批结果作为**一条** tool 回合入历史（与 assistant 那条的 tool_calls 一一对应）。
         conv.add_tool_results(results)

@@ -20,6 +20,10 @@ MAX_OUTPUT_CHARS = 30_000
 #: 「有上限」，不是「有上限地浪费」）。收到这个量就停手，剩下的交给 `_truncate` 标注。
 _MAX_PIPE_BYTES = 256 * 1024
 
+#: 上面那个上限的 KB 说法。只出现在**给模型看的文案**里——模型要的是一个能写进
+#: 它自己推理的量，`262144` 不如 `256KB` 好使。
+_MAX_PIPE_KB = _MAX_PIPE_BYTES // 1024
+
 
 def _kill_tree(proc: asyncio.subprocess.Process) -> None:
     """杀掉**整个进程组**，不只是 `sh` 自己。
@@ -58,7 +62,10 @@ class BashTool:
             "在当前工作目录下执行一条 shell 命令，返回退出码、标准输出与标准错误。"
             "适合跑测试、看 git 状态、列目录、统计行数这类事。"
             "命令会**真的被执行**，请只运行你确实需要、且不会破坏环境的命令。"
-            "超过 30 秒未结束的命令会被终止。"
+            "超过 30 秒未结束的命令会被终止；"
+            f"输出超过 {_MAX_PIPE_KB}KB 的命令也会被终止——"
+            "**那条命令的退出码会显示成 -9，那是 Qicode 发的，不是命令自己崩了**，"
+            "这种情况请缩小命令范围后重试。"
         )
 
     def parameters(self) -> dict[str, Any]:
@@ -102,24 +109,29 @@ class BashTool:
         except OSError as exc:
             return Result(f"命令启动失败: {exc}", is_error=True)
 
-        async def slurp(stream: asyncio.StreamReader) -> bytes:
+        async def slurp(stream: asyncio.StreamReader) -> tuple[bytes, bool]:
             """把一个管道读到 EOF，或者读满 `_MAX_PIPE_BYTES` 就停手。
 
             读满时**顺手把命令停掉**——这不是顺手，是必须的。stdout 读满之后我们
             不再读它，管道缓冲区（通常 64KB）很快就填满，子进程随即**阻塞在写 stdout 上**；
             于是 stderr 那头永远等不到 EOF，`gather` 永远不返回，整个工具卡死到超时。
             停掉整棵进程树是解开这个死锁的唯一办法。
+
+            返回 `(内容, 是不是因为读满上限才停的)`。第二个值要一路带到结果正文里去：
+            读满时我们**已经发过 SIGKILL**，`returncode` 会变成 `-9`——不说清楚的话，
+            模型只看到一个它没见过的信号退出码，然后开始瞎猜命令为什么崩，而真相是
+            「我们嫌它话太多，把它掐了」。
             """
             buffer = bytearray()
             while True:
                 chunk = await stream.read(65536)
                 if not chunk:
-                    return bytes(buffer)
+                    return bytes(buffer), False
                 room = _MAX_PIPE_BYTES - len(buffer)
                 if len(chunk) >= room:
                     buffer.extend(chunk[:room])
                     _kill_tree(proc)
-                    return bytes(buffer)
+                    return bytes(buffer), True
                 buffer.extend(chunk)
 
         try:
@@ -129,9 +141,10 @@ class BashTool:
             assert proc.stderr is not None
             # 两个管道**必须并发读**。顺序读会死锁：先读 stdout 读到 EOF 意味着等命令
             # 结束，而命令可能正卡在「stderr 写满了没人读」上。
-            stdout_bytes, stderr_bytes = await asyncio.gather(
-                slurp(proc.stdout), slurp(proc.stderr)
-            )
+            (
+                (stdout_bytes, stdout_capped),
+                (stderr_bytes, stderr_capped),
+            ) = await asyncio.gather(slurp(proc.stdout), slurp(proc.stderr))
             await proc.wait()
         except asyncio.CancelledError:
             # 走到这儿有两类原因：Registry 那层 `wait_for` 超时取消了，或者用户退出。
@@ -153,10 +166,32 @@ class BashTool:
 
         stdout = stdout_bytes.decode(errors="replace")
         stderr = stderr_bytes.decode(errors="replace")
-        body = f"exit_code: {proc.returncode}\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        # 读满上限时我们**发过 SIGKILL**，`returncode` 因此是 `-9`。这件事必须由我们
+        # 说出来：不说的话，模型看到的只是一个自己没发过的信号退出码，只能瞎猜命令为什么崩，
+        # 而真相是「它输出太多，被我们掐了」。它会去改命令的逻辑，而该改的是命令的**范围**。
+        #
+        # 位置很要紧：整体排在 `exit_code` 紧后面。`_truncate` 是**从尾部**切的
+        # （`text[:max_chars]`），写在前面的东西无论输出多长都不会被截掉——这条说明
+        # 恰恰是最需要在的时候在场的那种。
+        if stdout_capped or stderr_capped:
+            # 说清楚三件事：谁干的、为什么、接着怎么办。少了第三件，模型只知道
+            # 「失败了」却不知道出路，多半会把同一条命令原样再跑一遍。
+            cap_note = (
+                f"[输出超限] 命令的输出超过了 {_MAX_PIPE_KB}KB 上限，"
+                "已被 Qicode 主动终止。**上面那个退出码是我们发的 SIGKILL，"
+                "不是命令自己崩溃。**"
+                f"已保留前 {_MAX_PIPE_KB}KB，其余丢弃；"
+                "要拿到完整结果，请把命令的范围缩小，例如加 `| head -100` 或先 `grep` 过滤。\n"
+            )
+        else:
+            cap_note = ""
+        body = f"exit_code: {proc.returncode}\n{cap_note}stdout:\n{stdout}\nstderr:\n{stderr}"
         # 非零退出算**错误**（`docs/v2/spec.md` F9 把「命令超时 / 非零退出」与
         # 「文件不存在」并列成执行失败）：模型自己挑的命令跑挂了，就该一眼看出「这条没成」，
         # 而不是从一大段输出里自己琢磨。细节一个不少地留着，它照样能判断原因。
+        #
+        # 被我们掐掉的也算错误，尽管它未必是「命令写错了」——它没跑完，我们不能假装
+        # 拿到了一份完整的输出。`is_error` 说的是「这个结果不可全信」，正是这里的情况。
         return Result(
             _truncate(body, MAX_OUTPUT_LINES, MAX_OUTPUT_CHARS),
             is_error=proc.returncode != 0,

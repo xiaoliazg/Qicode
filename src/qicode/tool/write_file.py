@@ -1,19 +1,31 @@
 """`write_file`：写文件，父目录自动创建（F2-写）。"""
 
-import asyncio
 from pathlib import Path
 from typing import Any
 
-from qicode.tool import Result, _parse_args, _require_str, _require_text
+from qicode.tool import (
+    Result,
+    _NotRegularFile,
+    _parse_args,
+    _refuse_if_special,
+    _require_str,
+    _require_text,
+    _run_blocking,
+)
 
 
 def _write(target: Path, content: str) -> None:
     """建好父目录再写文件。
 
-    同步函数，由调用方丢进工作线程跑（理由同 `read_file._read_head`）：
-    路径是模型给的，可能落在网络盘上，`mkdir` / `write_text` 都可能阻塞，
-    而就地阻塞会冻住整个界面（N2）。
+    同步函数，由调用方丢进**守护线程**跑（理由同 `read_file._read_head`）：路径是模型
+    给的，可能落在网络盘上，`mkdir` / `write_text` 都可能阻塞，而就地阻塞会冻住整个
+    界面（N2）。用 `_run_blocking` 而不是 `asyncio.to_thread`，是为了让卡住的写在
+    进程退出时**不拦路**（见 `_run_blocking` 的说明）。
     """
+    # 非普通文件先拒了（`_refuse_if_special`）：往一个没有读端的 FIFO 上 `write_text`
+    # 是**永久阻塞**——`open()` 那一步就卡住，压根走不到写。文件不存在则放行，那正是
+    # 写文件最常见的情形（新建）。
+    _refuse_if_special(target)
     # `parents=True` 连同中间层一起建；`exist_ok=True` 让「父目录已经有了」不算错。
     # 裸文件名（如 `a.txt`）的 parent 是 `.`，建它也是无害的空操作。
     target.parent.mkdir(parents=True, exist_ok=True)
@@ -68,7 +80,11 @@ class WriteFileTool:
 
         target = Path(path)
         try:
-            await asyncio.to_thread(_write, target, content)
+            await _run_blocking(_write, target, content)
+        except _NotRegularFile as exc:
+            return Result(
+                f"{path} {exc.reason}，write_file 只能写普通文件", is_error=True
+            )
         except OSError as exc:
             return Result(f"写入失败: {path}: {exc}", is_error=True)
 

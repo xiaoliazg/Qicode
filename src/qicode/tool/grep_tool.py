@@ -57,8 +57,8 @@ def _alarm_armed() -> Iterator[bool]:
     比「慢一点」严重得多。
 
     **只对主线程有效**，这正是 `grep` 与 `read_file` 做法不同的原因：`read_file` 把整个
-    读丢进 `to_thread`，`grep` 不能——`signal.signal` 在非主线程直接抛 `ValueError`，
-    而这层保护恰恰是它最需要的东西。
+    读丢进工作线程（`_run_blocking`），`grep` 不能——`signal.signal` 在非主线程直接抛
+    `ValueError`，而这层保护恰恰是它最需要的东西。
 
     Windows 没有 `SIGALRM`、非主线程装不上，两种情况都降级成「不掐表」：灾难性回溯
     照旧会把那一行算完，但工具本身还能用，不会一上来就报错。
@@ -220,7 +220,7 @@ class GrepTool:
                 # 每进一个文件就让出一次 event loop：一次跨仓库的搜索可能扫几千个文件，
                 # 一直不放会把界面冻住（N2）。
                 #
-                # 这一句也是 `grep` 不能像 `read_file` 那样丢进 `to_thread` 的另一半理由：
+                # 这一句也是 `grep` 不能像 `read_file` 那样整个丢进线程的另一半理由：
                 # 丢进去了，这个「让出」就失去意义，而信号那层保护还会整个失效。
                 await asyncio.sleep(0)
                 if len(hits) >= MAX_HITS:

@@ -6,8 +6,11 @@
 
 import asyncio
 import json
+import os
 import signal
+import threading
 import time
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -18,6 +21,7 @@ from qicode.tool import (
     Result,
     Tool,
     _parse_args,
+    _run_blocking,
     _truncate,
     new_default_registry,
 )
@@ -260,6 +264,94 @@ def test_read_file_reports_bad_arguments(payload: str) -> None:
     result = run(ReadFileTool().execute(payload))
 
     assert result.is_error
+
+
+# ──────── 非普通文件：三个文件工具都要在门口拦下（管道 / 设备） ────────
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="这个平台没有 mkfifo")
+def test_read_file_refuses_a_fifo_instead_of_blocking(tmp_path: Any) -> None:
+    """管道要在**打开之前**就拒绝，不能放行让 `open()` 去碰运气。
+
+    没有写端的 FIFO 上 `open()` 会**永久阻塞**。实测过的形状：工具在 2 秒时如实报了
+    超时、`main()` 也返回了，可进程从此不动——因为那个线程还在默认线程池里，
+    `asyncio.run()` 收尾时要把池里每个线程 join 掉，只能 `kill -9`。这条用例钉的是
+    「在门口拦下」，让那个线程根本不会被创建出来。
+    """
+    fifo = tmp_path / "pipe"
+    os.mkfifo(fifo)
+
+    result = run(ReadFileTool().execute(args(path=str(fifo))))
+
+    assert result.is_error
+    assert "命名管道" in result.content
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="这个平台没有 mkfifo")
+def test_write_file_refuses_a_fifo(tmp_path: Any) -> None:
+    """往没有读端的 FIFO 上写，`open()` 那一步就卡住，压根走不到写。"""
+    fifo = tmp_path / "pipe"
+    os.mkfifo(fifo)
+
+    result = run(WriteFileTool().execute(args(path=str(fifo), content="内容")))
+
+    assert result.is_error
+    assert "命名管道" in result.content
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="这个平台没有 mkfifo")
+def test_edit_file_refuses_a_fifo(tmp_path: Any) -> None:
+    """`edit_file` 读的是**全文、没有上限**，撞上 FIFO 比 `read_file` 更没退路。"""
+    fifo = tmp_path / "pipe"
+    os.mkfifo(fifo)
+
+    result = run(
+        EditFileTool().execute(args(path=str(fifo), old_string="a", new_string="b"))
+    )
+
+    assert result.is_error
+    assert "命名管道" in result.content
+
+
+def test_write_file_still_creates_a_file_that_does_not_exist(tmp_path: Any) -> None:
+    """前置检查不能误伤「新建文件」——那正是写文件最常见的情形。"""
+    target = tmp_path / "新文件.txt"
+
+    result = run(WriteFileTool().execute(args(path=str(target), content="你好")))
+
+    assert not result.is_error
+    assert target.read_text(encoding="utf-8") == "你好"
+
+
+def test_a_symlink_to_a_regular_file_is_still_a_regular_file(tmp_path: Any) -> None:
+    """`stat` 跟符号链接，所以软链到普通文件要照常放行，不能连它一起拒了。"""
+    real = tmp_path / "真身.txt"
+    real.write_text("第一行\n", encoding="utf-8")
+    link = tmp_path / "软链.txt"
+    link.symlink_to(real)
+
+    result = run(ReadFileTool().execute(args(path=str(link))))
+
+    assert not result.is_error
+    assert "第一行" in result.content
+
+
+@pytest.mark.skipif(not Path("/dev/zero").exists(), reason="这个平台没有 /dev/zero")
+def test_read_file_refuses_a_character_device() -> None:
+    """/dev/zero 会一直吐零字节，读它等于跟一个无底洞要 EOF。"""
+    result = run(ReadFileTool().execute(args(path="/dev/zero")))
+
+    assert result.is_error
+    assert "字符设备" in result.content
+
+
+def test_read_file_still_reports_a_directory_as_a_directory(tmp_path: Any) -> None:
+    """目录**不在**这一道拦截里——那句「是一个目录」的文案得原样留着。"""
+    result = run(ReadFileTool().execute(args(path=str(tmp_path))))
+
+    assert result.is_error
+    assert "目录" in result.content
+    assert "普通文件" not in result.content
 
 
 # ────────────────────────── F2-写：write_file ──────────────────────────
@@ -509,6 +601,42 @@ def test_bash_nonzero_exit_is_error_but_keeps_output() -> None:
     assert result.is_error
     assert "exit_code: 3" in result.content
     assert "出错了" in result.content
+
+
+def test_bash_says_so_when_it_killed_the_command_for_too_much_output() -> None:
+    """输出读满上限时是我们发的 SIGKILL，这件事必须写在结果里（T5）。
+
+    不说的话，模型看到的只是一个 `exit_code: -9`——一个它没发过的信号退出码。它会去猜
+    「命令为什么崩」，然后去改命令的逻辑；而真正该改的是命令的**范围**。所以正文里
+    要有三件事：谁干的、为什么、接着怎么办。
+    """
+    result = run(BashTool().execute(args(command="yes | head -c 400000")))
+
+    assert result.is_error
+    assert "exit_code: -9" in result.content  # 原始事实照旧保留
+    assert "[输出超限]" in result.content
+    assert "SIGKILL" in result.content
+    assert "head" in result.content  # 给出路：把范围缩小
+
+
+def test_bash_does_not_cry_wolf_when_output_is_small() -> None:
+    """正常命令不能带上那段说明——假警报会让模型以为自己的命令有问题。"""
+    result = run(BashTool().execute(args(command="echo hi")))
+
+    assert "[输出超限]" not in result.content
+    assert "SIGKILL" not in result.content
+
+
+def test_the_output_cap_note_survives_truncation() -> None:
+    """说明必须排在 `exit_code` 紧后面：`_truncate` 从尾部切，写前面才留得住。
+
+    写后面的话，一段 256KB 的输出会把它顶到 30000 字符之外——**恰恰在最需要它的时候
+    它不在了**。这条用例把那个位置要求钉死。
+    """
+    result = run(BashTool().execute(args(command="yes | head -c 400000")))
+
+    # 说明出现在正文前部：整个开头就是「退出码 + 说明 + stdout:」。
+    assert result.content.startswith("exit_code: -9\n[输出超限]")
 
 
 def test_bash_timeout_is_reported_and_kills_the_process(tmp_path: Any) -> None:
@@ -763,3 +891,64 @@ def test_grep_leaves_the_alarm_handler_as_it_found_it(tmp_path: Any) -> None:
     run(GrepTool().execute(args(pattern="hello", path=str(tmp_path))))
 
     assert signal.getsignal(signal.SIGALRM) is before
+
+
+# ─────────── 阻塞调用：卡住的线程不能扣住进程（`_run_blocking`） ───────────
+
+
+def test_blocking_call_returns_the_value() -> None:
+    assert run(_run_blocking(lambda: 6 * 7)) == 42
+
+
+def test_blocking_call_propagates_the_exception() -> None:
+    def boom() -> None:
+        raise OSError("磁盘不认这个路径")
+
+    with pytest.raises(OSError, match="磁盘不认这个路径"):
+        run(_run_blocking(boom))
+
+
+def test_blocking_call_runs_on_a_daemon_thread() -> None:
+    """**这条是 `_run_blocking` 存在的全部理由。**
+
+    卡住的线程之所以能把进程扣住，是因为它在**默认线程池**里：`asyncio.run()` 收尾会调
+    `loop.shutdown_default_executor()`，把池里每一个线程 join 掉。换成守护线程之后
+    `threading._shutdown()` 会跳过它，进程想退就退——代价是那个线程泄漏一个。
+    """
+    seen: dict[str, bool] = {}
+
+    def remember() -> int:
+        seen["daemon"] = threading.current_thread().daemon
+        return 1
+
+    assert run(_run_blocking(remember)) == 1
+    assert seen["daemon"] is True
+
+
+def test_a_result_arriving_after_the_timeout_is_dropped_quietly() -> None:
+    """超时之后才回来的结果必须被丢掉，不能炸出 `InvalidStateError`。
+
+    `wait_for` 到点会把 Future 取消掉，而线程还在跑——它迟早会拿着结果回来 `set_result`。
+    不先查 `done()` 的话，那个异常会走 event loop 的异常处理器，在用户那里表现为
+    「界面莫名其妙打印一段 traceback」。
+    """
+
+    async def scenario() -> list[dict[str, Any]]:
+        loop = asyncio.get_running_loop()
+        caught: list[dict[str, Any]] = []
+        loop.set_exception_handler(lambda _loop, ctx: caught.append(ctx))
+
+        release = threading.Event()
+
+        def slow() -> str:
+            release.wait(5.0)  # 卡住，等测试放行——模拟挂死的网络盘读
+            return "迟到的结果"
+
+        with pytest.raises(TimeoutError):
+            await asyncio.wait_for(_run_blocking(slow), 0.05)
+
+        release.set()  # 放行：结果马上会回填到一个**已经取消**的 Future 上
+        await asyncio.sleep(0.3)
+        return caught
+
+    assert run(scenario()) == []

@@ -1,10 +1,30 @@
 """`edit_file`：唯一匹配替换（F2-改）。"""
 
-import asyncio
 from pathlib import Path
 from typing import Any
 
-from qicode.tool import Result, _parse_args, _require_str, _require_text
+from qicode.tool import (
+    Result,
+    _NotRegularFile,
+    _parse_args,
+    _refuse_if_special,
+    _require_str,
+    _require_text,
+    _run_blocking,
+)
+
+
+def _read_bytes(target: Path) -> bytes:
+    """读整个文件的**字节**。
+
+    同步函数，由调用方丢进**守护线程**跑（理由同 `read_file._read_head`）。
+
+    开读之前先拒掉非普通文件（`_refuse_if_special`）：这里读的是**全文、没有上限**，
+    撞上一个没有写端的 FIFO 就是永久阻塞——比 `read_file` 更没退路，那个至少还有
+    256KB 的护栏兜着。
+    """
+    _refuse_if_special(target)
+    return target.read_bytes()
 
 
 class EditFileTool:
@@ -58,15 +78,21 @@ class EditFileTool:
 
         target = Path(path)
         try:
-            # 读写都丢进工作线程（理由同 `read_file._read_head`）：路径由模型给出，
+            # 读写都丢进**守护线程**（理由同 `read_file._read_head`）：路径由模型给出，
             # 可能落在网络盘上。注意这里读的是**整个文件**，没有上限——编辑本来
             # 就得看全文，靠不了 read_file 那个 256KB 的护栏，所以更不能就地阻塞。
+            # 用 `_run_blocking` 而不是 `asyncio.to_thread`：卡住的线程在进程退出时
+            # 不该拦路（见 `_run_blocking` 的说明）。
             #
             # 读的是**字节**而不是 `read_text`，这一点是必须的：`read_text` 的两个默认值
             # 都会悄悄改动内容——`errors="replace"` 把非 UTF-8 的字节换成 U+FFFD（原文
             # 永久丢失），universal newlines 把 `\r\n` 折叠成 `\n`。而我们只打算改一小段，
             # 其余部分应当**一个字节都不动**。
-            raw = await asyncio.to_thread(target.read_bytes)
+            raw = await _run_blocking(_read_bytes, target)
+        except _NotRegularFile as exc:
+            return Result(
+                f"{path} {exc.reason}，edit_file 只能改普通文件", is_error=True
+            )
         except FileNotFoundError:
             return Result(f"文件不存在: {path}", is_error=True)
         except OSError as exc:
@@ -117,7 +143,7 @@ class EditFileTool:
         replacement = new.replace("\n", "\r\n") if "\r\n" in insert else new
         updated = text.replace(insert, replacement, 1).encode("utf-8")
         try:
-            await asyncio.to_thread(target.write_bytes, updated)
+            await _run_blocking(target.write_bytes, updated)
         except OSError as exc:
             return Result(f"写入失败: {path}: {exc}", is_error=True)
 

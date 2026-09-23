@@ -14,6 +14,7 @@ from typing import Any
 import pytest
 
 from qicode.agent import (
+    CANCELLED_RESULT,
     EMPTY_REPLY,
     MAX_ARGS_PREVIEW,
     TOOL_LIMIT,
@@ -111,6 +112,27 @@ def read_call(path: str = "a.py", call_id: str = "call_1") -> ToolCall:
 def find_end(events: list[Event]) -> Any:
     """取工具结束那一帧。"""
     return next(e.tool for e in events if e.tool and e.tool.phase is Phase.END)
+
+
+def orphaned_tool_use_ids(msgs: list[Message]) -> list[str]:
+    """列出所有**没有**配对的 `tool_use` id。
+
+    这是 Anthropic 协议的硬性要求：每个 `tool_use` 块必须在**紧邻的下一条**消息里
+    有配对的 `tool_result`。少一个服务端就 400——
+
+        'tool_use' ids were found without 'tool_result' blocks immediately after
+
+    ——所以这条不变量值得在测试里直接查，而不是靠某个具体用例「看着对」。
+    """
+    orphans: list[str] = []
+    for i, m in enumerate(msgs):
+        paired = (
+            {r.tool_call_id for r in msgs[i + 1].tool_results}
+            if i + 1 < len(msgs)
+            else set()
+        )
+        orphans += [c.id for c in m.tool_calls if c.id not in paired]
+    return orphans
 
 
 # ────────────────────────── AC8：工具轮闭环 ──────────────────────────
@@ -565,12 +587,19 @@ def test_cancellation_propagates_through_the_agent(make_provider) -> None:
 def test_cancellation_between_the_two_requests_leaves_clean_history(
     make_provider,
 ) -> None:
-    """在第一轮工具**执行期间**被取消：已经入历史的那条 assistant 回合原样留着。
+    """在第一轮工具**执行期间**被取消：历史必须补齐，不能留下孤儿 `tool_use`。
 
-    这是取消最难看的一种时机，值得钉死：assistant(tool_calls) 已经写进去了，而
-    工具结果永远等不到。留下来的历史是 **user + assistant(只调工具、无正文)**——
-    它本身合法（下一次请求模型会看到自己上次调了工具但没拿到结果），但要是这里
-    再多写一条空的 assistant，就会撞上「空 content 被服务端 400」那条老账。
+    这是取消最难看的一种时机：assistant(tool_calls) 已经写进去了，而工具结果永远
+    等不到。**把历史停在这里是不行的**——Anthropic 要求每个 `tool_use` 块在紧邻的
+    下一条消息里有配对的 `tool_result`，缺一个就 400：
+
+        'tool_use' ids were found without 'tool_result' blocks immediately after
+
+    而且这段历史**留在会话里**，之后每一轮都撞同一个 400——一次打断就能废掉整场
+    对话（T19 用真端点实测确认过）。所以取消时要把没轮到的调用补一条说明再抛出去。
+
+    **这条用例在 T19 之前钉的是错的行为**：它断言历史停在 `[user, assistant]`，
+    注释还写着那样「本身合法」。实测证明不合法，断言因此反了过来。
 
     为了让取消**精确**落在工具执行那一下，这里的工具是个永远不返回的假货，
     靠轮询事件流而不是靠定时——定时在快机器上会变成「碰运气」。
@@ -606,9 +635,86 @@ def test_cancellation_between_the_two_requests_leaves_clean_history(
     asyncio.run(scenario())
 
     msgs = conv.messages()
-    assert [m.role for m in msgs] == ["user", "assistant"]
-    # 留下来的每一条都**有内容**：那条 assistant 靠 tool_calls 撑着，正文是空的，
-    # 但它不是一个「空回合」——空回合（正文和 tool_calls 都空）才是会被 400 的那种。
-    assert msgs[1].tool_calls != []
-    # 而且没有留下半截的最终答复。
-    assert not any(m.role == "tool" for m in msgs)
+    # 补了一条 tool 回合，这是这次修复的核心。
+    assert [m.role for m in msgs] == ["user", "assistant", "tool"]
+    # 而且**每个** tool_use 都有配对的 tool_result——这正是服务端校验的那条规则。
+    assert orphaned_tool_use_ids(msgs) == []
+    # 补进去的那条要说清「是被取消了」，不能让模型以为工具跑成功、返回了个空的。
+    filled = msgs[2].tool_results
+    assert [r.tool_call_id for r in filled] == ["call_1"]
+    assert CANCELLED_RESULT in filled[0].content
+    assert filled[0].is_error is True
+    # 没有留下半截的最终答复。
+    assert not any(m.content == "好了" for m in msgs)
+
+
+def test_a_partly_executed_tool_round_keeps_the_real_results_it_already_got(
+    make_provider,
+) -> None:
+    """打断时**已经跑完**的工具，真结果必须保留——只补没轮到的那几个。
+
+    这是 `_complete_tool_round` 的边界：不能图省事把整批都写成「已取消」，那会把
+    真结果一起抹掉，模型下一轮只能重跑一遍——批量里第一个工具可能是个写文件，
+    重跑的代价不是白跑一次而已。
+
+    这条和上一条合起来才说明白「补齐」到底是什么意思：**缺的补占位，有的原样留**。
+    """
+    provider = make_provider(
+        [
+            [
+                StreamEvent(
+                    tool_calls=[
+                        ToolCall(id="call_ok", name="echo", input='{"path": "a.py"}'),
+                        ToolCall(
+                            id="call_hang", name="read_file", input='{"path": "b.py"}'
+                        ),
+                    ]
+                ),
+                StreamEvent(done=True),
+            ],
+            [StreamEvent(text="好了"), StreamEvent(done=True)],
+        ]
+    )
+    conv = Conversation()
+    conv.add_user("读两个文件")
+    seen: list[Event] = []
+
+    async def scenario() -> None:
+        async def consume() -> None:
+            registry = Registry()
+            registry.register(CountingTool("echo"))
+            # 第二个工具永远不返回，用来把取消卡在「批量的中途」。
+            registry.register(HangingTool())
+            async for event in Agent(provider, registry).run(conv):
+                seen.append(event)
+
+        task = asyncio.create_task(consume())
+
+        def starts() -> list[Event]:
+            return [e for e in seen if e.tool and e.tool.phase is Phase.START]
+
+        while len(starts()) < 2:
+            await asyncio.sleep(0)
+        # 再让出几次，确保生产者已经走进第二个工具的 `await`——那里它永远不会回来。
+        # 多让几次不影响断言：第一个工具的结果在那之前就已经落进 `results` 了。
+        for _ in range(5):
+            await asyncio.sleep(0)
+
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(scenario())
+
+    msgs = conv.messages()
+    assert [m.role for m in msgs] == ["user", "assistant", "tool"]
+    assert orphaned_tool_use_ids(msgs) == []
+
+    got = {r.tool_call_id: r for r in msgs[2].tool_results}
+    assert set(got) == {"call_ok", "call_hang"}
+    # 第一个：跑完了，真结果一字未改。
+    assert "读到了" in got["call_ok"].content
+    assert got["call_ok"].is_error is False
+    # 第二个：没轮到，补的是取消说明。
+    assert got["call_hang"].content == CANCELLED_RESULT
+    assert got["call_hang"].is_error is True
